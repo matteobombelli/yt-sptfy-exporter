@@ -5,7 +5,7 @@ A simple desktop app that downloads all songs from a **Spotify** or **YouTube** 
 - **YouTube playlist URL** → downloaded directly.
 - **Spotify playlist URL** → track metadata is fetched from the Spotify API, each track is matched against YouTube search results (title similarity + duration), and confident matches are downloaded. Tracks without a confident match are skipped and listed at the end.
 
-Songs are saved as `<Title>.mp3`; for Spotify playlists the files are tagged with Title, Artist, and Album metadata.
+Songs are saved as `<Title>.mp3`; for Spotify playlists the files are tagged with Title, Artist, and Album metadata, plus embedded album-art cover.
 
 ## Installation
 

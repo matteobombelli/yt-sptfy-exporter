@@ -12,6 +12,7 @@ import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import tkinter as tk
 import urllib.error
@@ -55,9 +56,15 @@ def spotify_token(client_id, client_secret):
         return json.load(resp)["access_token"]
 
 
+def _largest_image(images):
+    """Pick the highest-resolution URL from a list of {url, width, height}."""
+    best = max(images or [], key=lambda im: (im.get("width") or 0), default=None)
+    return best["url"] if best else ""
+
+
 def spotify_tracks(token, playlist_id):
     url = (f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
-           "?limit=100&fields=next,items(track(name,duration_ms,artists(name),album(name)))")
+           "?limit=100&fields=next,items(track(name,duration_ms,artists(name),album(name,images)))")
     tracks = []
     while url:
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
@@ -66,10 +73,12 @@ def spotify_tracks(token, playlist_id):
         for item in data["items"]:
             t = item.get("track")
             if t and t.get("name"):
+                album = t.get("album") or {}
                 tracks.append({
                     "artist": t["artists"][0]["name"] if t["artists"] else "",
                     "title": t["name"],
-                    "album": (t.get("album") or {}).get("name", ""),
+                    "album": album.get("name", ""),
+                    "art_url": _largest_image(album.get("images")),
                     "duration": (t.get("duration_ms") or 0) / 1000,
                 })
         url = data.get("next")
@@ -120,10 +129,12 @@ def _pathfinder_tracks(playlist_id, token):
             if data.get("__typename") != "Track" or not data.get("name"):
                 continue
             artists = [a["profile"]["name"] for a in data["artists"]["items"]]
+            album = data.get("albumOfTrack") or {}
             tracks.append({
                 "artist": artists[0] if artists else "",
                 "title": data["name"],
-                "album": (data.get("albumOfTrack") or {}).get("name", ""),
+                "album": album.get("name", ""),
+                "art_url": _largest_image((album.get("coverArt") or {}).get("sources")),
                 "duration": data["trackDuration"]["totalMilliseconds"] / 1000,
             })
         offset += 100
@@ -140,6 +151,7 @@ def spotify_tracks_noauth(playlist_id, log):
             "artist": t.get("subtitle") or "",
             "title": t["title"],
             "album": "",
+            "art_url": "",
             "duration": (t.get("duration") or 0) / 1000,
         } for t in state["data"]["entity"]["trackList"]]
 
@@ -195,7 +207,21 @@ def unique_base(outdir, name):
     return str(base)
 
 
-def download_mp3(url, out_path_no_ext, meta=None):
+def _fetch_art(art_url):
+    """Download cover art to a temp file. Returns the path, or None on failure."""
+    try:
+        req = urllib.request.Request(art_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return path
+    except Exception:
+        return None
+
+
+def download_mp3(url, out_path_no_ext, meta=None, art_url=None):
     opts = {
         "format": "bestaudio/best",
         "outtmpl": f"{out_path_no_ext}.%(ext)s",
@@ -212,16 +238,27 @@ def download_mp3(url, out_path_no_ext, meta=None):
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
-    if meta:
-        mp3 = f"{out_path_no_ext}.mp3"
-        tagged = f"{out_path_no_ext}.tagged.mp3"
-        cmd = ["ffmpeg", "-y", "-i", mp3, "-c", "copy"]
-        for key, value in meta.items():
-            if value:
-                cmd += ["-metadata", f"{key}={value}"]
-        cmd.append(tagged)
+
+    art_path = _fetch_art(art_url) if art_url else None
+    if not meta and not art_path:
+        return
+    mp3 = f"{out_path_no_ext}.mp3"
+    tagged = f"{out_path_no_ext}.tagged.mp3"
+    cmd = ["ffmpeg", "-y", "-i", mp3]
+    if art_path:
+        cmd += ["-i", art_path, "-map", "0:a", "-map", "1:v",
+                "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
+    cmd += ["-c", "copy", "-id3v2_version", "3"]
+    for key, value in (meta or {}).items():
+        if value:
+            cmd += ["-metadata", f"{key}={value}"]
+    cmd.append(tagged)
+    try:
         subprocess.run(cmd, check=True, capture_output=True)
         os.replace(tagged, mp3)
+    finally:
+        if art_path:
+            os.remove(art_path)
 
 
 # ---------- worker jobs (run in a thread, report via queue) ----------
@@ -256,7 +293,7 @@ def run_spotify_job(url, outdir, cfg, q):
                     "title": track["title"],
                     "artist": track["artist"],
                     "album": track.get("album", ""),
-                })
+                }, art_url=track.get("art_url", ""))
         except Exception as e:
             skipped.append(label)
             q.put(("log", f"[{i}/{len(tracks)}] Failed: {label} ({e})"))
