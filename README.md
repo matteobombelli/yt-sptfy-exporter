@@ -46,28 +46,8 @@ uv run app.py
 
 On first run, uv automatically creates a virtual environment (`.venv/`) and installs the dependencies.
 
-Paste a playlist URL, choose an output folder, and click **Download**.
+Paste a playlist or song URL, choose an output folder, and click **Download**.
 
-## Spotify API setup
-
-Downloading from Spotify playlists requires free Spotify API credentials:
-
-1. Go to <https://developer.spotify.com/dashboard> and log in with any Spotify account.
-2. Click **Create app**. Name it anything, set the Redirect URI to `http://localhost` (required field, not used by this app), and check the **Web API** box.
-3. Open the app's **Settings** and copy the **Client ID** and **Client Secret**.
-4. Provide them to the app either way:
-   - The app prompts for them the first time you submit a Spotify URL, or
-   - Edit `config.json` (auto-created next to `app.py` on first run):
-
-   ```json
-   {
-     "spotify_client_id": "your-client-id",
-     "spotify_client_secret": "your-client-secret"
-   }
-   ```
-
-`config.json` is gitignored, so your credentials stay out of version control.
-
-> Note: the app uses the Client Credentials flow, so only **public** playlists work.
-
-> **Heads-up:** Spotify currently blocks the playlist-tracks endpoint for newly created API apps (HTTP 403). When that happens, the app automatically falls back to the public web-player API (no credentials needed, playlists of any length). The official API path is kept for apps with grandfathered or extended-quota access.
+No Spotify account or API credentials are needed — track metadata is read from the
+same public web-player API the Spotify embed widget uses, so only **public**
+playlists and tracks work.
