@@ -6,6 +6,7 @@ Spotify playlists are resolved track-by-track via YouTube search.
 
 import base64
 import difflib
+import glob
 import json
 import os
 import queue
@@ -62,6 +63,18 @@ def _largest_image(images):
     return best["url"] if best else ""
 
 
+def _track_from_api(t):
+    """Build our track dict from a Spotify Web API track object."""
+    album = t.get("album") or {}
+    return {
+        "artist": t["artists"][0]["name"] if t["artists"] else "",
+        "title": t["name"],
+        "album": album.get("name", ""),
+        "art_url": _largest_image(album.get("images")),
+        "duration": (t.get("duration_ms") or 0) / 1000,
+    }
+
+
 def spotify_tracks(token, playlist_id):
     url = (f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
            "?limit=100&fields=next,items(track(name,duration_ms,artists(name),album(name,images)))")
@@ -73,16 +86,18 @@ def spotify_tracks(token, playlist_id):
         for item in data["items"]:
             t = item.get("track")
             if t and t.get("name"):
-                album = t.get("album") or {}
-                tracks.append({
-                    "artist": t["artists"][0]["name"] if t["artists"] else "",
-                    "title": t["name"],
-                    "album": album.get("name", ""),
-                    "art_url": _largest_image(album.get("images")),
-                    "duration": (t.get("duration_ms") or 0) / 1000,
-                })
+                tracks.append(_track_from_api(t))
         url = data.get("next")
     return tracks
+
+
+def spotify_track(token, track_id):
+    req = urllib.request.Request(
+        f"https://api.spotify.com/v1/tracks/{track_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        return _track_from_api(json.load(resp))
 
 
 # Fallback for when Spotify blocks the playlist-tracks endpoint (403, the case
@@ -94,9 +109,9 @@ PATHFINDER_URL = "https://api-partner.spotify.com/pathfinder/v1/query"
 FETCH_PLAYLIST_HASH = "b39f62e9b566aa849b1780927de1450f47e02c54abf1e66e513f96e849591e41"
 
 
-def _embed_state(playlist_id):
+def _embed_state(item_id, kind="playlist"):
     req = urllib.request.Request(
-        f"https://open.spotify.com/embed/playlist/{playlist_id}",
+        f"https://open.spotify.com/embed/{kind}/{item_id}",
         headers={"User-Agent": "Mozilla/5.0"},
     )
     with urllib.request.urlopen(req) as resp:
@@ -156,6 +171,19 @@ def spotify_tracks_noauth(playlist_id, log):
         } for t in state["data"]["entity"]["trackList"]]
 
 
+def spotify_track_noauth(track_id):
+    ent = _embed_state(track_id, kind="track")["data"]["entity"]
+    images = ent.get("visualIdentity", {}).get("image") or []
+    best = max(images, key=lambda im: (im.get("maxWidth") or 0), default=None)
+    return {
+        "artist": ent["artists"][0]["name"] if ent.get("artists") else "",
+        "title": ent.get("name") or ent.get("title", ""),
+        "album": "",  # not exposed on the embed page for single tracks
+        "art_url": best["url"] if best else "",
+        "duration": (ent.get("duration") or 0) / 1000,
+    }
+
+
 # ---------- youtube matching ----------
 
 BRACKETS = re.compile(r"\(.*?\)|\[.*?\]")
@@ -168,22 +196,33 @@ def normalize(s):
     return re.sub(r"[^a-z0-9]+", " ", s).strip()
 
 
-def match_score(track, entry):
+LIVE_WORD = re.compile(r"\blive\b")
+
+
+def match_score(track, entry, preference="none"):
     want = normalize(f"{track['artist']} {track['title']}")
     got = normalize(entry.get("title") or "")
     score = difflib.SequenceMatcher(None, want, got).ratio()
     duration = entry.get("duration")
     if track["duration"] and duration and abs(duration - track["duration"]) > DURATION_TOLERANCE:
         score -= 0.2
+    # detect "live" on the raw title - normalize() strips "(Live)" brackets
+    is_live = bool(LIVE_WORD.search((entry.get("title") or "").lower()))
+    if preference == "studio" and is_live:
+        score -= 0.3
+    elif preference == "live" and is_live:
+        score += 0.3
     return score
 
 
-def find_youtube_match(track, search_ydl):
+def find_youtube_match(track, search_ydl, preference="none"):
     query = f"{track['artist']} {track['title']}"
+    if preference == "live":
+        query += " live"
     info = search_ydl.extract_info(f"ytsearch5:{query}", download=False)
     best, best_score = None, 0.0
     for entry in info.get("entries") or []:
-        score = match_score(track, entry)
+        score = match_score(track, entry, preference)
         if score > best_score:
             best, best_score = entry, score
     if best and best_score >= MATCH_THRESHOLD:
@@ -198,17 +237,20 @@ def sanitize(name):
 
 
 def unique_base(outdir, name):
-    """Path (without extension) for name.mp3, adding (2), (3)... on collision."""
+    """Path (without extension) for name.*, adding (2), (3)... on collision."""
     base = Path(outdir) / name
     n = 2
-    while base.with_suffix(".mp3").exists():
+    while list(Path(outdir).glob(glob.escape(base.name) + ".*")):
         base = Path(outdir) / f"{name} ({n})"
         n += 1
     return str(base)
 
 
-def _fetch_art(art_url):
-    """Download cover art to a temp file. Returns the path, or None on failure."""
+def _fetch_art(art_url, crop_square=False):
+    """Download cover art to a temp file. Returns the path, or None on failure.
+
+    When crop_square is set (YouTube's 16:9 thumbnails), center-crop to a square.
+    """
     try:
         req = urllib.request.Request(art_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req) as resp:
@@ -216,35 +258,51 @@ def _fetch_art(art_url):
         fd, path = tempfile.mkstemp(suffix=".jpg")
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+        if crop_square:
+            cropped = path + ".sq.jpg"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", path, "-vf",
+                 "crop='min(iw,ih)':'min(iw,ih)'", cropped],
+                check=True, capture_output=True)
+            os.replace(cropped, path)
         return path
     except Exception:
         return None
 
 
-def download_mp3(url, out_path_no_ext, meta=None, art_url=None):
+def download_audio(url, out_path_no_ext, quality="192", meta=None, art_url=None,
+                   crop_square=False):
+    """Download audio to out_path_no_ext.<ext>.
+
+    quality is a kbps string (transcode to MP3) or "best" (keep native stream).
+    Returns the final file path.
+    """
     opts = {
         "format": "bestaudio/best",
         "outtmpl": f"{out_path_no_ext}.%(ext)s",
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
         "quiet": True,
         "noprogress": True,
         # let yt-dlp fetch its JS challenge solver (runs on deno), needed for
         # full YouTube format access
         "remote_components": ["ejs:github"],
     }
+    if quality != "best":
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": quality,
+        }]
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+        info = ydl.extract_info(url, download=True)
+        out = f"{out_path_no_ext}.mp3" if quality != "best" else ydl.prepare_filename(info)
 
-    art_path = _fetch_art(art_url) if art_url else None
+    art_path = _fetch_art(art_url, crop_square) if art_url else None
     if not meta and not art_path:
-        return
-    mp3 = f"{out_path_no_ext}.mp3"
-    tagged = f"{out_path_no_ext}.tagged.mp3"
-    cmd = ["ffmpeg", "-y", "-i", mp3]
+        return out
+
+    ext = Path(out).suffix  # e.g. .mp3 / .m4a / .opus
+    tagged = f"{out_path_no_ext}.tagged{ext}"
+    cmd = ["ffmpeg", "-y", "-i", out]
     if art_path:
         cmd += ["-i", art_path, "-map", "0:a", "-map", "1:v",
                 "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
@@ -255,26 +313,44 @@ def download_mp3(url, out_path_no_ext, meta=None, art_url=None):
     cmd.append(tagged)
     try:
         subprocess.run(cmd, check=True, capture_output=True)
-        os.replace(tagged, mp3)
+        os.replace(tagged, out)
+    except subprocess.CalledProcessError:
+        # cover embedding can fail for some containers (e.g. opus); retry
+        # metadata-only so the download isn't lost
+        if art_path:
+            cmd = ["ffmpeg", "-y", "-i", out, "-c", "copy", "-id3v2_version", "3"]
+            for key, value in (meta or {}).items():
+                if value:
+                    cmd += ["-metadata", f"{key}={value}"]
+            cmd.append(tagged)
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                os.replace(tagged, out)
+            except subprocess.CalledProcessError:
+                pass
     finally:
         if art_path:
             os.remove(art_path)
+    return out
 
 
 # ---------- worker jobs (run in a thread, report via queue) ----------
 
-def run_spotify_job(url, outdir, cfg, q):
-    playlist_id = re.search(r"playlist/([A-Za-z0-9]+)", url).group(1)
-    q.put(("log", "Fetching Spotify playlist metadata..."))
+def run_spotify_job(url, outdir, cfg, q, preference="none", quality="192"):
+    track_match = re.search(r"track/([A-Za-z0-9]+)", url)
+    item_id = (track_match or re.search(r"playlist/([A-Za-z0-9]+)", url)).group(1)
+    is_track = bool(track_match)
+    q.put(("log", f"Fetching Spotify {'track' if is_track else 'playlist'} metadata..."))
     try:
         token = spotify_token(cfg["spotify_client_id"], cfg["spotify_client_secret"])
-        tracks = spotify_tracks(token, playlist_id)
+        tracks = [spotify_track(token, item_id)] if is_track else spotify_tracks(token, item_id)
     except urllib.error.HTTPError as e:
         if e.code != 403:
             raise
-        q.put(("log", "Spotify API denied playlist access (new API apps are restricted) - "
+        q.put(("log", "Spotify API denied access (new API apps are restricted) - "
                       "falling back to the public web-player API."))
-        tracks = spotify_tracks_noauth(playlist_id, lambda msg: q.put(("log", msg)))
+        tracks = ([spotify_track_noauth(item_id)] if is_track
+                  else spotify_tracks_noauth(item_id, lambda msg: q.put(("log", msg))))
     q.put(("log", f"Found {len(tracks)} tracks. Searching YouTube..."))
     q.put(("progress", 0, len(tracks)))
 
@@ -283,13 +359,14 @@ def run_spotify_job(url, outdir, cfg, q):
     for i, track in enumerate(tracks, 1):
         label = f"{track['artist']} - {track['title']}"
         try:
-            video_url, score = find_youtube_match(track, search_ydl)
+            video_url, score = find_youtube_match(track, search_ydl, preference)
             if not video_url:
                 skipped.append(label)
                 q.put(("log", f"[{i}/{len(tracks)}] Skipped (no confident match, best {score:.2f}): {label}"))
             else:
                 q.put(("log", f"[{i}/{len(tracks)}] Downloading (match {score:.2f}): {label}"))
-                download_mp3(video_url, unique_base(outdir, sanitize(track["title"])), meta={
+                download_audio(video_url, unique_base(outdir, sanitize(track["title"])),
+                               quality=quality, meta={
                     "title": track["title"],
                     "artist": track["artist"],
                     "album": track.get("album", ""),
@@ -305,7 +382,7 @@ def run_spotify_job(url, outdir, cfg, q):
     q.put(("done", summary))
 
 
-def run_youtube_job(url, outdir, q):
+def run_youtube_job(url, outdir, q, quality="192"):
     q.put(("log", "Fetching YouTube playlist..."))
     with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "noprogress": True}) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -313,13 +390,23 @@ def run_youtube_job(url, outdir, q):
     q.put(("log", f"Found {len(entries)} videos."))
     q.put(("progress", 0, len(entries)))
 
+    detail_ydl = yt_dlp.YoutubeDL({"quiet": True, "noprogress": True})
     failed = []
     for i, entry in enumerate(entries, 1):
         title = entry.get("title") or entry.get("id", "unknown")
         try:
             q.put(("log", f"[{i}/{len(entries)}] Downloading: {title}"))
             video_url = entry.get("url") or entry.get("webpage_url")
-            download_mp3(video_url, unique_base(outdir, sanitize(title)))
+            full = detail_ydl.extract_info(video_url, download=False)
+            title = full.get("title") or title
+            meta = {
+                "title": full.get("track") or full.get("title", ""),
+                "artist": full.get("artist") or full.get("uploader", ""),
+                "album": full.get("album", ""),
+            }
+            download_audio(video_url, unique_base(outdir, sanitize(title)),
+                           quality=quality, meta=meta,
+                           art_url=full.get("thumbnail", ""), crop_square=True)
         except Exception as e:
             failed.append(title)
             q.put(("log", f"[{i}/{len(entries)}] Failed: {title} ({e})"))
@@ -394,9 +481,9 @@ class App:
         main = ttk.Frame(root, padding=16)
         main.pack(fill="both", expand=True)
         main.columnconfigure(1, weight=1)
-        main.rowconfigure(4, weight=1)
+        main.rowconfigure(5, weight=1)
 
-        ttk.Label(main, text="Playlist URL (Spotify or YouTube):").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(main, text="Spotify or YouTube URL (playlist or song):").grid(row=0, column=0, columnspan=3, sticky="w")
         self.url_var = tk.StringVar()
         ttk.Entry(main, textvariable=self.url_var).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 10))
 
@@ -405,18 +492,29 @@ class App:
         ttk.Entry(main, textvariable=self.folder_var).grid(row=2, column=1, sticky="ew", padx=(8, 8))
         ttk.Button(main, text="Browse…", command=self._browse).grid(row=2, column=2)
 
+        options = ttk.Frame(main)
+        options.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(options, text="Spotify version:").pack(side="left")
+        self.pref_var = tk.StringVar(value="none")
+        for label, value in (("No preference", "none"), ("Studio", "studio"), ("Live", "live")):
+            ttk.Radiobutton(options, text=label, value=value, variable=self.pref_var).pack(side="left", padx=(6, 0))
+        ttk.Label(options, text="Quality:").pack(side="left", padx=(16, 0))
+        self.quality_var = tk.StringVar(value="192 kbps")
+        ttk.Combobox(options, textvariable=self.quality_var, state="readonly", width=24,
+                     values=("128 kbps", "192 kbps", "Best quality (no re-encode)")).pack(side="left", padx=(6, 0))
+
         self.download_btn = ttk.Button(main, text="Download", style="Accent.TButton", command=self._start)
-        self.download_btn.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 8))
+        self.download_btn.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 8))
 
         self.log = tk.Text(main, height=12, state="disabled", wrap="word",
                            relief="flat", background="#f5f5f5")
-        self.log.grid(row=4, column=0, columnspan=3, sticky="nsew")
+        self.log.grid(row=5, column=0, columnspan=3, sticky="nsew")
         scroll = ttk.Scrollbar(main, command=self.log.yview)
-        scroll.grid(row=4, column=3, sticky="ns")
+        scroll.grid(row=5, column=3, sticky="ns")
         self.log["yscrollcommand"] = scroll.set
 
         self.progress = ttk.Progressbar(main, mode="determinate")
-        self.progress.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.progress.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
         if not shutil.which("ffmpeg"):
             self._log("WARNING: ffmpeg not found on PATH - MP3 conversion will fail. See README.")
@@ -437,12 +535,12 @@ class App:
     def _start(self):
         url = self.url_var.get().strip()
         outdir = self.folder_var.get().strip()
-        if "open.spotify.com" in url and re.search(r"playlist/([A-Za-z0-9]+)", url):
+        if "open.spotify.com" in url and re.search(r"(playlist|track)/([A-Za-z0-9]+)", url):
             kind = "spotify"
         elif "youtube.com" in url or "youtu.be" in url:
             kind = "youtube"
         else:
-            messagebox.showerror("Invalid URL", "Enter a Spotify playlist URL or a YouTube URL.")
+            messagebox.showerror("Invalid URL", "Enter a Spotify playlist/track URL or a YouTube URL.")
             return
         if not outdir or not Path(outdir).is_dir():
             messagebox.showerror("No output folder", "Choose an existing output folder.")
@@ -451,14 +549,17 @@ class App:
             if not CredentialsDialog(self.root, self.cfg).saved:
                 return
 
+        choice = self.quality_var.get()
+        quality = "best" if choice.startswith("Best") else choice.split()[0]
+
         self.download_btn["state"] = "disabled"
         self.progress["value"] = 0
         if kind == "spotify":
             target = run_spotify_job
-            args = (url, outdir, self.cfg, self.q)
+            args = (url, outdir, self.cfg, self.q, self.pref_var.get(), quality)
         else:
             target = run_youtube_job
-            args = (url, outdir, self.q)
+            args = (url, outdir, self.q, quality)
         threading.Thread(target=self._guarded, args=(target, args), daemon=True).start()
 
     def _guarded(self, target, args):

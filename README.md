@@ -1,11 +1,18 @@
 # yt-sptfy-exporter
 
-A simple desktop app that downloads all songs from a **Spotify** or **YouTube** playlist as MP3 files.
+A simple desktop app that downloads songs from a **Spotify** or **YouTube** playlist — or a single song link — as audio files.
 
-- **YouTube playlist URL** → downloaded directly.
-- **Spotify playlist URL** → track metadata is fetched from the Spotify API, each track is matched against YouTube search results (title similarity + duration), and confident matches are downloaded. Tracks without a confident match are skipped and listed at the end.
+- **YouTube URL** (playlist or video) → downloaded directly.
+- **Spotify URL** (playlist or track) → track metadata is fetched from Spotify, each track is matched against YouTube search results (title similarity + duration), and confident matches are downloaded. Tracks without a confident match are skipped and listed at the end.
 
-Songs are saved as `<Title>.mp3`; for Spotify playlists the files are tagged with Title, Artist, and Album metadata, plus embedded album-art cover.
+Files are tagged with Title, Artist, and Album metadata plus an embedded cover image — from Spotify for Spotify links, and from YouTube (thumbnail center-cropped to a square) for YouTube links.
+
+## Options
+
+- **Spotify version** — *No preference* / *Studio* / *Live*. Biases the YouTube match toward studio or live recordings (applies to Spotify links only).
+- **Quality** — *128 kbps* / *192 kbps* MP3, or *Best quality (no re-encode)* which keeps YouTube's native audio stream (`.opus`/`.m4a`) untouched.
+
+> On audio quality: YouTube's source audio tops out around 128–160 kbps Opus, so 192 kbps MP3 is already at the source ceiling — higher MP3 bitrates would only add file size, not fidelity. Choose **Best quality** to preserve the source exactly.
 
 ## Installation
 
