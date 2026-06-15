@@ -3,7 +3,7 @@ name = "yt-sptfy-exporter"
 version = "0.1.0"
 description = "Download Spotify or YouTube playlists as MP3s"
 requires-python = ">=3.10"
-dependencies = ["yt-dlp"]
+dependencies = ["yt-dlp", "mutagen"]
 
 [tool.uv]
 package = false

@@ -5,6 +5,7 @@ Spotify tracks are resolved track-by-track via YouTube search. No Spotify
 credentials are needed - metadata comes from the public web-player API.
 """
 
+import base64
 import difflib
 import glob
 import json
@@ -22,6 +23,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import yt_dlp
+from mutagen.flac import Picture
+from mutagen.oggopus import OggOpus
 
 MATCH_THRESHOLD = 0.6
 DURATION_TOLERANCE = 15  # seconds
@@ -270,20 +273,45 @@ def download_audio(url, out_path_no_ext, quality="192", meta=None, art_url=None,
     if not any(meta.values()) and not art_path:
         return out
 
-    ext = Path(out).suffix  # e.g. .mp3 / .m4a / .opus
-    tagged = f"{out_path_no_ext}.tagged{ext}"
-    _tag(out, tagged, meta, art_path, ext)
+    _tag(out, meta, art_path)
     if art_path:
         os.remove(art_path)
     return out
 
 
-def _tag(src, dst, meta, art_path, ext):
-    """Copy src to dst embedding metadata (and cover art if given), then replace
-    src. Cover embedding can fail for some containers (e.g. opus in webm), so
-    retry metadata-only rather than lose the download."""
+def _tag(path, meta, art_path):
+    """Embed metadata (and cover art if given) into path, in place."""
+    if path.endswith(".opus"):
+        _tag_opus(path, meta, art_path)
+    else:
+        _tag_ffmpeg(path, meta, art_path)
+
+
+def _tag_opus(path, meta, art_path):
+    """Tag an Opus file with mutagen - ffmpeg's Ogg muxer can't write a cover,
+    but Opus carries it losslessly in a METADATA_BLOCK_PICTURE comment."""
+    audio = OggOpus(path)
+    for key in ("title", "artist", "album"):
+        if meta.get(key):
+            audio[key] = meta[key]
+    if art_path:
+        pic = Picture()
+        pic.type = 3  # front cover
+        pic.mime = "image/jpeg"
+        pic.data = Path(art_path).read_bytes()
+        audio["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
+    audio.save()
+
+
+def _tag_ffmpeg(path, meta, art_path):
+    """Tag an MP3/M4A file by remuxing through ffmpeg (lossless -c copy). Cover
+    embedding can fail for odd inputs, so retry metadata-only rather than lose
+    the download."""
+    ext = Path(path).suffix
+    dst = f"{path}.tagged{ext}"
+
     def run(with_art):
-        cmd = ["ffmpeg", "-y", "-i", src]
+        cmd = ["ffmpeg", "-y", "-i", path]
         if with_art:
             cmd += ["-i", art_path, "-map", "0:a", "-map", "1:v",
                     "-disposition:v:0", "attached_pic",
@@ -296,7 +324,7 @@ def _tag(src, dst, meta, art_path, ext):
                 cmd += ["-metadata", f"{key}={value}"]
         cmd.append(dst)
         subprocess.run(cmd, check=True, capture_output=True)
-        os.replace(dst, src)
+        os.replace(dst, path)
 
     for with_art in ([True, False] if art_path else [False]):
         try:
