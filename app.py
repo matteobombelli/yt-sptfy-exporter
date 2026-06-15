@@ -27,6 +27,14 @@ MATCH_THRESHOLD = 0.6
 DURATION_TOLERANCE = 15  # seconds
 ACCENT = "#1DB954"
 
+# (dropdown label, quality code passed to download_audio)
+QUALITY_CHOICES = [
+    ("128 kbps MP3", "128"),
+    ("192 kbps MP3", "192"),
+    ("Best (Opus, lossless)", "opus"),
+    ("Best (.m4a, lossless)", "m4a"),
+]
+
 
 # ---------- spotify (public web-player API, no credentials) ----------
 
@@ -208,13 +216,14 @@ def _fetch_art(art_url, crop_square=False):
 
 def download_audio(url, out_path_no_ext, quality="192", meta=None, art_url=None,
                    crop_square=False):
-    """Download audio to out_path_no_ext.<ext>.
+    """Download audio to out_path_no_ext.<ext>. Returns the final file path.
 
-    quality is a kbps string (transcode to MP3) or "best" (keep native stream).
-    Returns the final file path.
+    quality is one of:
+      "128"/"192" - transcode to MP3 at that kbps (lossy)
+      "opus"      - keep YouTube's native Opus stream, repackaged to .opus (lossless)
+      "m4a"       - keep YouTube's native AAC stream, copied to .m4a (lossless)
     """
     opts = {
-        "format": "bestaudio/best",
         "outtmpl": f"{out_path_no_ext}.%(ext)s",
         "quiet": True,
         "noprogress": True,
@@ -222,15 +231,30 @@ def download_audio(url, out_path_no_ext, quality="192", meta=None, art_url=None,
         # full YouTube format access
         "remote_components": ["ejs:github"],
     }
-    if quality != "best":
+    if quality == "opus":
+        opts["format"] = "bestaudio[acodec=opus]/bestaudio"
+        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "opus"}]
+        out = f"{out_path_no_ext}.opus"
+    elif quality == "m4a":
+        # AAC-only so the copy below is truly lossless (no Opus->AAC re-encode)
+        opts["format"] = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]"
+        out = None  # set from prepare_filename after extraction
+    else:
+        opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": quality,
-        }]
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        out = f"{out_path_no_ext}.mp3" if quality != "best" else ydl.prepare_filename(info)
+            "key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": quality}]
+        out = f"{out_path_no_ext}.mp3"
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if out is None:
+                out = ydl.prepare_filename(info)
+    except yt_dlp.utils.DownloadError as e:
+        if quality == "m4a":
+            raise RuntimeError(
+                "no lossless .m4a (AAC) stream available - try 'Best (Opus, lossless)' instead") from e
+        raise
 
     # With no caller-supplied metadata (the YouTube path), pull it from the video.
     if meta is None:
@@ -388,9 +412,9 @@ class App:
         for label, value in (("No preference", "none"), ("Studio", "studio"), ("Live", "live")):
             ttk.Radiobutton(options, text=label, value=value, variable=self.pref_var).pack(side="left", padx=(6, 0))
         ttk.Label(options, text="Quality:").pack(side="left", padx=(16, 0))
-        self.quality_var = tk.StringVar(value="192 kbps")
-        ttk.Combobox(options, textvariable=self.quality_var, state="readonly", width=24,
-                     values=("128 kbps", "192 kbps", "Best quality (no re-encode)")).pack(side="left", padx=(6, 0))
+        self.quality_var = tk.StringVar(value="192 kbps MP3")
+        ttk.Combobox(options, textvariable=self.quality_var, state="readonly", width=22,
+                     values=[label for label, _ in QUALITY_CHOICES]).pack(side="left", padx=(6, 0))
 
         self.download_btn = ttk.Button(main, text="Download", style="Accent.TButton", command=self._start)
         self.download_btn.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 8))
@@ -435,8 +459,7 @@ class App:
             messagebox.showerror("No output folder", "Choose an existing output folder.")
             return
 
-        choice = self.quality_var.get()
-        quality = "best" if choice.startswith("Best") else choice.split()[0]
+        quality = dict(QUALITY_CHOICES)[self.quality_var.get()]
 
         self.download_btn["state"] = "disabled"
         self.progress["value"] = 0

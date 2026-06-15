@@ -10,9 +10,12 @@ Files are tagged with Title, Artist, and Album metadata plus an embedded cover i
 ## Options
 
 - **Spotify version** — *No preference* / *Studio* / *Live*. Biases the YouTube match toward studio or live recordings (applies to Spotify links only).
-- **Quality** — *128 kbps* / *192 kbps* MP3, or *Best quality (no re-encode)* which keeps YouTube's native audio stream (`.opus`/`.m4a`) untouched.
+- **Quality**:
+  - *128 / 192 kbps MP3* — transcoded to MP3. Universal, but a lossy re-encode of an already-lossy source (some quality is lost).
+  - *Best (Opus, lossless)* — keeps YouTube's native Opus stream, repackaged to `.opus`. **No quality loss** and the best fidelity (Opus beats AAC at the same bitrate). Tags are embedded; cover art is not (Opus container limitation).
+  - *Best (.m4a, lossless)* — copies YouTube's native AAC stream to `.m4a`. No re-encode, plays everywhere, embeds cover art. Slightly lower bitrate source than Opus, and not every video offers it — if it's missing, the log will tell you to use *Best (Opus)* instead.
 
-> On audio quality: YouTube's source audio tops out around 128–160 kbps Opus, so 192 kbps MP3 is already at the source ceiling — higher MP3 bitrates would only add file size, not fidelity. Choose **Best quality** to preserve the source exactly.
+> Why the MP3 options lose quality: YouTube audio is already compressed (~128–160 kbps Opus), so re-encoding it to MP3 compresses it a second time. The **Best** options avoid this entirely by keeping the original stream. Don't bother going above 192 kbps MP3 — it only adds file size, not fidelity.
 
 ## Installation
 
