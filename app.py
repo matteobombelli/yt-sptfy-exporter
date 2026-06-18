@@ -28,6 +28,8 @@ from mutagen.oggopus import OggOpus
 
 MATCH_THRESHOLD = 0.6
 DURATION_TOLERANCE = 15  # seconds
+MIN_SOURCE_KBPS = 100   # drop tracks whose best available YouTube audio is below this (degraded uploads)
+SEARCH_RESULTS = 10     # candidates to scan per track
 ACCENT = "#1DB954"
 
 # (dropdown label, quality code passed to download_audio)
@@ -143,38 +145,65 @@ def normalize(s):
     return re.sub(r"[^a-z0-9]+", " ", s).strip()
 
 
-LIVE_WORD = re.compile(r"\blive\b")
+# matched on the raw title - normalize() strips "(Live)"/"(Remix)" brackets
+LIVE_PATTERNS = re.compile(r"\b(live|concert|unplugged|tour)\b")
+JUNK_PATTERNS = re.compile(r"\b(remix|sped[\s-]?up|slowed|nightcore|reverb|8d|cover|karaoke|mashup)\b")
 
 
-def match_score(track, entry, preference="none"):
+def version_allowed(title, preference):
+    """True if a candidate title is acceptable for the requested version.
+
+    studio - reject live takes and weird versions (remix/sped-up/nightcore/...).
+    live   - require a live indicator.
+    none   - everything allowed.
+    Word-boundary matching can mis-flag legitimate titles ("Live and Let Die",
+    "Cover Me"); accepted, since every drop is reported.
+    """
+    t = (title or "").lower()
+    if preference == "studio":
+        return not (LIVE_PATTERNS.search(t) or JUNK_PATTERNS.search(t))
+    if preference == "live":
+        return bool(LIVE_PATTERNS.search(t))
+    return True
+
+
+def match_score(track, entry):
     want = normalize(f"{track['artist']} {track['title']}")
     got = normalize(entry.get("title") or "")
     score = difflib.SequenceMatcher(None, want, got).ratio()
     duration = entry.get("duration")
     if track["duration"] and duration and abs(duration - track["duration"]) > DURATION_TOLERANCE:
         score -= 0.2
-    # detect "live" on the raw title - normalize() strips "(Live)" brackets
-    is_live = bool(LIVE_WORD.search((entry.get("title") or "").lower()))
-    if preference == "studio" and is_live:
-        score -= 0.3
-    elif preference == "live" and is_live:
-        score += 0.3
     return score
 
 
 def find_youtube_match(track, search_ydl, preference="none"):
+    """Return (url, score, reason). On success reason is None; otherwise it's a
+    short explanation of why no track was selected."""
     query = f"{track['artist']} {track['title']}"
     if preference == "live":
         query += " live"
-    info = search_ydl.extract_info(f"ytsearch5:{query}", download=False)
+    info = search_ydl.extract_info(f"ytsearch{SEARCH_RESULTS}:{query}", download=False)
+    entries = [e for e in (info.get("entries") or []) if version_allowed(e.get("title"), preference)]
+    if not entries:
+        return None, 0.0, f"no {preference} version in top {SEARCH_RESULTS} results"
     best, best_score = None, 0.0
-    for entry in info.get("entries") or []:
-        score = match_score(track, entry, preference)
+    for entry in entries:
+        score = match_score(track, entry)
         if score > best_score:
             best, best_score = entry, score
     if best and best_score >= MATCH_THRESHOLD:
-        return best["url"], best_score
-    return None, best_score
+        return best["url"], best_score, None
+    return None, best_score, f"no confident match, best {best_score:.2f}"
+
+
+def best_audio_kbps(url, probe_ydl):
+    """Best available audio bitrate (kbps) for url, or 0 if undeterminable."""
+    info = probe_ydl.extract_info(url, download=False)
+    rates = [f.get("abr") or f.get("tbr") or 0
+             for f in (info.get("formats") or [])
+             if f.get("acodec") not in (None, "none")]
+    return max(rates, default=0)
 
 
 # ---------- download ----------
@@ -347,22 +376,30 @@ def run_spotify_job(url, outdir, q, preference="none", quality="192"):
     q.put(("progress", 0, len(tracks)))
 
     search_ydl = yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "noprogress": True})
+    probe_ydl = yt_dlp.YoutubeDL({"quiet": True, "noprogress": True})
     skipped = []
     for i, track in enumerate(tracks, 1):
         label = f"{track['artist']} - {track['title']}"
         try:
-            video_url, score = find_youtube_match(track, search_ydl, preference)
+            video_url, score, reason = find_youtube_match(track, search_ydl, preference)
             if not video_url:
                 skipped.append(label)
-                q.put(("log", f"[{i}/{len(tracks)}] Skipped (no confident match, best {score:.2f}): {label}"))
-            else:
-                q.put(("log", f"[{i}/{len(tracks)}] Downloading (match {score:.2f}): {label}"))
-                download_audio(video_url, unique_base(outdir, sanitize(track["title"])),
-                               quality=quality, meta={
-                    "title": track["title"],
-                    "artist": track["artist"],
-                    "album": track.get("album", ""),
-                }, art_url=track.get("art_url", ""))
+                q.put(("log", f"[{i}/{len(tracks)}] Skipped ({reason}): {label}"))
+                q.put(("progress", i, len(tracks)))
+                continue
+            kbps = best_audio_kbps(video_url, probe_ydl)
+            if 0 < kbps < MIN_SOURCE_KBPS:
+                skipped.append(label)
+                q.put(("log", f"[{i}/{len(tracks)}] Skipped (source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor): {label}"))
+                q.put(("progress", i, len(tracks)))
+                continue
+            q.put(("log", f"[{i}/{len(tracks)}] Downloading (match {score:.2f}): {label}"))
+            download_audio(video_url, unique_base(outdir, sanitize(track["title"])),
+                           quality=quality, meta={
+                               "title": track["title"],
+                               "artist": track["artist"],
+                               "album": track.get("album", ""),
+                           }, art_url=track.get("art_url", ""))
         except Exception as e:
             skipped.append(label)
             q.put(("log", f"[{i}/{len(tracks)}] Failed: {label} ({e})"))
@@ -382,12 +419,19 @@ def run_youtube_job(url, outdir, q, quality="192"):
     q.put(("log", f"Found {len(entries)} videos."))
     q.put(("progress", 0, len(entries)))
 
+    probe_ydl = yt_dlp.YoutubeDL({"quiet": True, "noprogress": True})
     failed = []
     for i, entry in enumerate(entries, 1):
         title = entry.get("title") or entry.get("id", "unknown")
         try:
-            q.put(("log", f"[{i}/{len(entries)}] Downloading: {title}"))
             video_url = entry.get("url") or entry.get("webpage_url")
+            kbps = best_audio_kbps(video_url, probe_ydl)
+            if 0 < kbps < MIN_SOURCE_KBPS:
+                failed.append(title)
+                q.put(("log", f"[{i}/{len(entries)}] Skipped (source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor): {title}"))
+                q.put(("progress", i, len(entries)))
+                continue
+            q.put(("log", f"[{i}/{len(entries)}] Downloading: {title}"))
             # metadata + thumbnail are pulled from the video inside download_audio
             download_audio(video_url, unique_base(outdir, sanitize(title)),
                            quality=quality, crop_square=True)
