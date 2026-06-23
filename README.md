@@ -3,7 +3,7 @@
 A simple desktop app that downloads songs from a **Spotify** or **YouTube** playlist — or a single song link — as audio files.
 
 - **YouTube URL** (playlist or video) → downloaded directly.
-- **Spotify URL** (playlist or track) → track metadata is fetched from Spotify, each track is matched against YouTube search results (title similarity + duration), and confident matches are downloaded. Tracks without a confident match are skipped and listed at the end.
+- **Spotify URL** (playlist or track) → track metadata is fetched from Spotify, then each track is matched against search results (title similarity + duration) — **SoundCloud first, then YouTube** as a fallback — and confident matches are downloaded. Tracks without a confident match on either source are skipped and listed at the end.
 
 Files are tagged with Title, Artist, and Album metadata plus an embedded cover image — from Spotify for Spotify links, and from YouTube (thumbnail center-cropped to a square) for YouTube links.
 

@@ -30,6 +30,9 @@ MATCH_THRESHOLD = 0.6
 DURATION_TOLERANCE = 15  # seconds
 MIN_SOURCE_KBPS = 100   # drop tracks whose best available YouTube audio is below this (degraded uploads)
 SEARCH_RESULTS = 10     # candidates to scan per track
+# Spotify tracks are resolved against each source in order, first confident
+# match that downloads wins; YouTube is the fallback when SoundCloud comes up short.
+SEARCH_SOURCES = [("SoundCloud", "scsearch"), ("YouTube", "ytsearch")]
 ACCENT = "#1DB954"
 
 # (dropdown label, quality code passed to download_audio)
@@ -177,13 +180,14 @@ def match_score(track, entry):
     return score
 
 
-def find_youtube_match(track, search_ydl, preference="none"):
+def find_match(track, search_ydl, preference="none", search_prefix="ytsearch"):
     """Return (url, score, reason). On success reason is None; otherwise it's a
-    short explanation of why no track was selected."""
+    short explanation of why no track was selected. search_prefix selects the
+    yt-dlp backend: "ytsearch" (YouTube) or "scsearch" (SoundCloud)."""
     query = f"{track['artist']} {track['title']}"
     if preference == "live":
         query += " live"
-    info = search_ydl.extract_info(f"ytsearch{SEARCH_RESULTS}:{query}", download=False)
+    info = search_ydl.extract_info(f"{search_prefix}{SEARCH_RESULTS}:{query}", download=False)
     entries = [e for e in (info.get("entries") or []) if version_allowed(e.get("title"), preference)]
     if not entries:
         return None, 0.0, f"no {preference} version in top {SEARCH_RESULTS} results"
@@ -380,29 +384,31 @@ def run_spotify_job(url, outdir, q, preference="none", quality="192"):
     skipped = []
     for i, track in enumerate(tracks, 1):
         label = f"{track['artist']} - {track['title']}"
-        try:
-            video_url, score, reason = find_youtube_match(track, search_ydl, preference)
-            if not video_url:
-                skipped.append(label)
-                q.put(("log", f"[{i}/{len(tracks)}] Skipped ({reason}): {label}"))
-                q.put(("progress", i, len(tracks)))
-                continue
-            kbps = best_audio_kbps(video_url, probe_ydl)
-            if 0 < kbps < MIN_SOURCE_KBPS:
-                skipped.append(label)
-                q.put(("log", f"[{i}/{len(tracks)}] Skipped (source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor): {label}"))
-                q.put(("progress", i, len(tracks)))
-                continue
-            q.put(("log", f"[{i}/{len(tracks)}] Downloading (match {score:.2f}): {label}"))
-            download_audio(video_url, unique_base(outdir, sanitize(track["title"])),
-                           quality=quality, meta={
-                               "title": track["title"],
-                               "artist": track["artist"],
-                               "album": track.get("album", ""),
-                           }, art_url=track.get("art_url", ""))
-        except Exception as e:
+        reasons, downloaded = [], False
+        for source_name, prefix in SEARCH_SOURCES:
+            try:
+                url, score, reason = find_match(track, search_ydl, preference, prefix)
+                if not url:
+                    reasons.append(f"{source_name}: {reason}")
+                    continue
+                kbps = best_audio_kbps(url, probe_ydl)
+                if 0 < kbps < MIN_SOURCE_KBPS:
+                    reasons.append(f"{source_name}: source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor")
+                    continue
+                q.put(("log", f"[{i}/{len(tracks)}] Downloading from {source_name} (match {score:.2f}): {label}"))
+                download_audio(url, unique_base(outdir, sanitize(track["title"])),
+                               quality=quality, meta={
+                                   "title": track["title"],
+                                   "artist": track["artist"],
+                                   "album": track.get("album", ""),
+                               }, art_url=track.get("art_url", ""))
+                downloaded = True
+                break
+            except Exception as e:
+                reasons.append(f"{source_name}: {e}")
+        if not downloaded:
             skipped.append(label)
-            q.put(("log", f"[{i}/{len(tracks)}] Failed: {label} ({e})"))
+            q.put(("log", f"[{i}/{len(tracks)}] Skipped: {label} ({'; '.join(reasons)})"))
         q.put(("progress", i, len(tracks)))
 
     summary = f"Done: {len(tracks) - len(skipped)} downloaded, {len(skipped)} skipped."
