@@ -32,10 +32,12 @@ DEFAULT_STRICTNESS = 0.7  # match-score floor; user-adjustable 0..1 via the UI s
 DURATION_TOLERANCE = 15  # seconds
 MIN_SOURCE_KBPS = 100   # drop tracks whose best available YouTube audio is below this (degraded uploads)
 SEARCH_RESULTS = 10     # candidates to scan per track
-MAX_WORKERS = 6         # concurrent track downloads; raise for speed, lower if YouTube throttles
-# Pull YouTube cookies from the local browser; authenticated requests get
-# throttled far less than anonymous ones. Change to ("chrome",), ("brave",), etc.
-COOKIES_FROM_BROWSER = ("firefox",)
+MAX_WORKERS = 1         # concurrent track downloads; raise for speed, lower if YouTube throttles
+# No browser cookies: feeding logged-in YouTube cookies to yt-dlp's default web
+# client makes YouTube serve PO-token/SABR formats whose media fetch 403s.
+# Anonymous requests get the normal formats and download fine. Set to a tuple
+# like ("firefox",) only if you need logged-in access (private/age-restricted).
+COOKIES_FROM_BROWSER = None
 ACCENT = "#1DB954"
 
 # (dropdown label, quality code passed to download_audio)
@@ -409,6 +411,13 @@ def _is_rate_limit(e):
     return "429" in s or "too many requests" in s
 
 
+def _is_bot_block(e):
+    # A 403 from YouTube's anti-bot wall. Unlike a 429 these can also be
+    # permanent (private/forbidden video), so the retry path is capped.
+    s = str(e).lower()
+    return "403" in s or "forbidden" in s or "sign in to confirm" in s
+
+
 def _is_cookie_error(e):
     # Only meaningful when we're actually reading browser cookies; otherwise a
     # stray "cookie" in an error (e.g. yt-dlp's bot-check message that suggests
@@ -459,7 +468,7 @@ class DownloadGate:
         if wait_only:
             self._gate.wait()  # another worker is already cooling down; ride it out
             return
-        self.q.put(("log", f"YouTube rate limit hit (HTTP 429). Pausing all "
+        self.q.put(("log", f"YouTube throttling/blocking (HTTP 429/403). Pausing all "
                            f"downloads for {self.cooldown}s, then retrying..."))
         for _ in range(self.cooldown):
             if self.aborted.is_set():
@@ -472,9 +481,16 @@ class DownloadGate:
             self.q.put(("log", "Cooldown over - resuming downloads."))
 
 
+MAX_BLOCK_RETRIES = 3  # cooldown+retry attempts before giving up on a 429/403
+
+
 def run_with_retry(gate, fn):
-    """Run fn(), retrying after a cooldown on YouTube 429s and aborting the job
-    on cookie errors. Any other exception propagates to the caller unchanged."""
+    """Run fn(), retrying after a cooldown on YouTube 429/403s and aborting the
+    job on cookie errors. A 403 can be permanent (private/forbidden video), so
+    retries are capped at MAX_BLOCK_RETRIES, after which the error propagates and
+    the track is skipped. Any other exception propagates to the caller
+    unchanged."""
+    retries = 0
     while True:
         if not gate.wait_ready():
             raise JobAborted()
@@ -487,7 +503,10 @@ def run_with_retry(gate, fn):
                 gate.abort(f"Could not read YouTube cookies from the browser ({e}). "
                            f"Check COOKIES_FROM_BROWSER and that you're logged into YouTube.")
                 raise JobAborted()
-            if _is_rate_limit(e):
+            if _is_rate_limit(e) or _is_bot_block(e):
+                retries += 1
+                if retries > MAX_BLOCK_RETRIES:
+                    raise
                 gate.cooldown_and_retry()
                 continue
             raise
