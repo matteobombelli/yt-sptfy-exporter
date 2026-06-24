@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import tkinter as tk
 import urllib.parse
 import urllib.request
@@ -31,7 +32,10 @@ DEFAULT_STRICTNESS = 0.7  # match-score floor; user-adjustable 0..1 via the UI s
 DURATION_TOLERANCE = 15  # seconds
 MIN_SOURCE_KBPS = 100   # drop tracks whose best available YouTube audio is below this (degraded uploads)
 SEARCH_RESULTS = 10     # candidates to scan per track
-MAX_WORKERS = 10        # concurrent track downloads; raise for speed, lower if YouTube throttles
+MAX_WORKERS = 6         # concurrent track downloads; raise for speed, lower if YouTube throttles
+# Pull YouTube cookies from the local browser; authenticated requests get
+# throttled far less than anonymous ones. Change to ("chrome",), ("brave",), etc.
+COOKIES_FROM_BROWSER = ("firefox",)
 ACCENT = "#1DB954"
 
 # (dropdown label, quality code passed to download_audio)
@@ -41,6 +45,15 @@ QUALITY_CHOICES = [
     ("Best (Opus, lossless)", "opus"),
     ("Best (.m4a, lossless)", "m4a"),
 ]
+
+
+def make_ydl(**opts):
+    """A yt-dlp instance carrying our shared defaults: quiet output and, when the
+    user has enabled it, cookies pulled from the local browser (see
+    COOKIES_FROM_BROWSER). Per-call options override these defaults."""
+    return yt_dlp.YoutubeDL(
+        {"quiet": True, "noprogress": True,
+         "cookiesfrombrowser": COOKIES_FROM_BROWSER, **opts})
 
 
 # ---------- spotify (public web-player API, no credentials) ----------
@@ -277,6 +290,7 @@ def download_audio(url, out_path_no_ext, quality="192", meta=None, art_url=None,
         "outtmpl": f"{out_path_no_ext}.%(ext)s",
         "quiet": True,
         "noprogress": True,
+        "cookiesfrombrowser": COOKIES_FROM_BROWSER,
         # let yt-dlp fetch its JS challenge solver (runs on deno), needed for
         # full YouTube format access
         "remote_components": ["ejs:github"],
@@ -381,6 +395,104 @@ def _tag_ffmpeg(path, meta, art_path):
             continue
 
 
+# ---------- rate-limit / cookie handling ----------
+
+RATE_LIMIT_COOLDOWN = 60  # seconds to pause all workers after a YouTube 429 before retrying
+
+
+class JobAborted(Exception):
+    """Raised inside a worker to unwind it once the job has been aborted."""
+
+
+def _is_rate_limit(e):
+    s = str(e).lower()
+    return "429" in s or "too many requests" in s
+
+
+def _is_cookie_error(e):
+    # Only meaningful when we're actually reading browser cookies; otherwise a
+    # stray "cookie" in an error (e.g. yt-dlp's bot-check message that suggests
+    # --cookies-from-browser) must not be mistaken for an extraction failure.
+    if not COOKIES_FROM_BROWSER:
+        return False
+    s = str(e).lower()
+    return any(k in s for k in ("cookie", "keyring", "could not decrypt", "dpapi"))
+
+
+class DownloadGate:
+    """Shared by a job's workers to coordinate YouTube rate-limiting.
+
+    On a 429 the worker that hit it clears the gate (pausing every worker),
+    sleeps a cooldown, then reopens it; concurrent 429s coalesce into a single
+    cooldown rather than stacking. A cookie error aborts the whole job instead -
+    retrying can't fix a misconfigured browser, and silently skipping every
+    track is what we're trying to avoid."""
+
+    def __init__(self, q, cooldown=RATE_LIMIT_COOLDOWN):
+        self.q = q
+        self.cooldown = cooldown
+        self._gate = threading.Event()
+        self._gate.set()
+        self._lock = threading.Lock()
+        self._cooling = False
+        self.aborted = threading.Event()
+        self.abort_reason = None
+
+    def wait_ready(self):
+        """Block while a cooldown is in progress. Returns False if aborted."""
+        self._gate.wait()
+        return not self.aborted.is_set()
+
+    def abort(self, reason):
+        with self._lock:
+            if not self.aborted.is_set():
+                self.abort_reason = reason
+                self.aborted.set()
+        self._gate.set()  # wake any workers parked in wait_ready / cooldown
+
+    def cooldown_and_retry(self):
+        with self._lock:
+            wait_only = self._cooling
+            if not wait_only:
+                self._cooling = True
+                self._gate.clear()
+        if wait_only:
+            self._gate.wait()  # another worker is already cooling down; ride it out
+            return
+        self.q.put(("log", f"YouTube rate limit hit (HTTP 429). Pausing all "
+                           f"downloads for {self.cooldown}s, then retrying..."))
+        for _ in range(self.cooldown):
+            if self.aborted.is_set():
+                break
+            time.sleep(1)
+        with self._lock:
+            self._cooling = False
+        self._gate.set()
+        if not self.aborted.is_set():
+            self.q.put(("log", "Cooldown over - resuming downloads."))
+
+
+def run_with_retry(gate, fn):
+    """Run fn(), retrying after a cooldown on YouTube 429s and aborting the job
+    on cookie errors. Any other exception propagates to the caller unchanged."""
+    while True:
+        if not gate.wait_ready():
+            raise JobAborted()
+        try:
+            return fn()
+        except JobAborted:
+            raise
+        except Exception as e:
+            if _is_cookie_error(e):
+                gate.abort(f"Could not read YouTube cookies from the browser ({e}). "
+                           f"Check COOKIES_FROM_BROWSER and that you're logged into YouTube.")
+                raise JobAborted()
+            if _is_rate_limit(e):
+                gate.cooldown_and_retry()
+                continue
+            raise
+
+
 # ---------- worker jobs (run in a thread, report via queue) ----------
 
 def run_spotify_job(url, outdir, q, preference="none", quality="192", strictness=DEFAULT_STRICTNESS):
@@ -395,9 +507,12 @@ def run_spotify_job(url, outdir, q, preference="none", quality="192", strictness
     q.put(("progress", 0, total))
 
     skipped, reserved, lock, done = [], set(), threading.Lock(), 0
+    gate = DownloadGate(q)
 
     def handle(i, track):
         nonlocal done
+        if gate.aborted.is_set():
+            return
         label = f"{track['artist']} - {track['title']}"
 
         def skip(msg):
@@ -406,24 +521,28 @@ def run_spotify_job(url, outdir, q, preference="none", quality="192", strictness
             q.put(("log", f"[{i}/{total}] Skipped: {label} ({msg})"))
 
         # yt-dlp instances aren't thread-safe, so each worker gets its own.
-        search_ydl = yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "noprogress": True})
-        probe_ydl = yt_dlp.YoutubeDL({"quiet": True, "noprogress": True})
+        search_ydl = make_ydl(extract_flat=True)
+        probe_ydl = make_ydl()
         try:
-            match_url, score, reason = find_match(track, search_ydl, preference, strictness)
+            match_url, score, reason = run_with_retry(
+                gate, lambda: find_match(track, search_ydl, preference, strictness))
             if not match_url:
                 skip(reason)
                 return
-            kbps = best_audio_kbps(match_url, probe_ydl)
+            kbps = run_with_retry(gate, lambda: best_audio_kbps(match_url, probe_ydl))
             if 0 < kbps < MIN_SOURCE_KBPS:
                 skip(f"source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor")
                 return
             q.put(("log", f"[{i}/{total}] Downloading (match {score:.2f}): {label}"))
-            download_audio(match_url, unique_base(outdir, sanitize(track["title"]), reserved, lock),
-                           quality=quality, meta={
-                               "title": track["title"],
-                               "artist": track["artist"],
-                               "album": track.get("album", ""),
-                           }, art_url=track.get("art_url", ""))
+            base = unique_base(outdir, sanitize(track["title"]), reserved, lock)
+            run_with_retry(gate, lambda: download_audio(
+                match_url, base, quality=quality, meta={
+                    "title": track["title"],
+                    "artist": track["artist"],
+                    "album": track.get("album", ""),
+                }, art_url=track.get("art_url", "")))
+        except JobAborted:
+            return
         except Exception as e:
             skip(str(e))
         finally:
@@ -436,6 +555,10 @@ def run_spotify_job(url, outdir, q, preference="none", quality="192", strictness
         for i, track in enumerate(tracks, 1):
             ex.submit(handle, i, track)
 
+    if gate.aborted.is_set():
+        q.put(("done", f"Stopped: {gate.abort_reason}"))
+        return
+
     summary = f"Done: {total - len(skipped)} downloaded, {len(skipped)} skipped."
     if skipped:
         summary += "\nSkipped tracks:\n  " + "\n  ".join(skipped)
@@ -443,9 +566,17 @@ def run_spotify_job(url, outdir, q, preference="none", quality="192", strictness
 
 
 def run_youtube_job(url, outdir, q, quality="192"):
+    gate = DownloadGate(q)
     q.put(("log", "Fetching YouTube playlist..."))
-    with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "noprogress": True}) as ydl:
-        info = ydl.extract_info(url, download=False)
+
+    def fetch():
+        with make_ydl(extract_flat=True) as ydl:
+            return ydl.extract_info(url, download=False)
+    try:
+        info = run_with_retry(gate, fetch)
+    except JobAborted:
+        q.put(("done", f"Stopped: {gate.abort_reason}"))
+        return
     entries = [e for e in (info.get("entries") if "entries" in info else [info]) if e]
     total = len(entries)
     q.put(("log", f"Found {total} videos. Downloading ({MAX_WORKERS} at a time)..."))
@@ -455,11 +586,13 @@ def run_youtube_job(url, outdir, q, quality="192"):
 
     def handle(i, entry):
         nonlocal done
+        if gate.aborted.is_set():
+            return
         title = entry.get("title") or entry.get("id", "unknown")
-        probe_ydl = yt_dlp.YoutubeDL({"quiet": True, "noprogress": True})
+        probe_ydl = make_ydl()
         try:
             video_url = entry.get("url") or entry.get("webpage_url")
-            kbps = best_audio_kbps(video_url, probe_ydl)
+            kbps = run_with_retry(gate, lambda: best_audio_kbps(video_url, probe_ydl))
             if 0 < kbps < MIN_SOURCE_KBPS:
                 with lock:
                     failed.append(title)
@@ -467,8 +600,11 @@ def run_youtube_job(url, outdir, q, quality="192"):
                 return
             q.put(("log", f"[{i}/{total}] Downloading: {title}"))
             # metadata + thumbnail are pulled from the video inside download_audio
-            download_audio(video_url, unique_base(outdir, sanitize(title), reserved, lock),
-                           quality=quality, crop_square=True)
+            base = unique_base(outdir, sanitize(title), reserved, lock)
+            run_with_retry(gate, lambda: download_audio(
+                video_url, base, quality=quality, crop_square=True))
+        except JobAborted:
+            return
         except Exception as e:
             with lock:
                 failed.append(title)
@@ -482,6 +618,10 @@ def run_youtube_job(url, outdir, q, quality="192"):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for i, entry in enumerate(entries, 1):
             ex.submit(handle, i, entry)
+
+    if gate.aborted.is_set():
+        q.put(("done", f"Stopped: {gate.abort_reason}"))
+        return
 
     summary = f"Done: {total - len(failed)} downloaded, {len(failed)} failed."
     if failed:

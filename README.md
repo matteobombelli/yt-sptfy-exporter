@@ -55,3 +55,43 @@ Paste a playlist or song URL, choose an output folder, and click **Download**.
 No Spotify account or API credentials are needed — track metadata is read from the
 same public web-player API the Spotify embed widget uses, so only **public**
 playlists and tracks work.
+
+## Avoiding YouTube rate-limiting
+
+YouTube throttles anonymous downloads by IP. If you grab a large playlist (or run
+several at once), you may start seeing `HTTP Error 429`. The fix is to download as a
+**logged-in user** — authenticated requests are throttled far less. The app does this
+by reading YouTube cookies straight from your browser, so there's no copying or
+exporting of cookie files.
+
+1. Log into YouTube in your browser and stay logged in.
+2. Tell the app which browser to read cookies from. Open `app.py` and set
+   `COOKIES_FROM_BROWSER` (near the top) to your browser:
+
+   ```python
+   COOKIES_FROM_BROWSER = ("firefox",)   # or ("chrome",), ("brave",), ("chromium",), ("edge",)
+   ```
+
+That's it — the cookies are picked up automatically on the next run.
+
+### If you still get rate-limited
+
+A 429 is **not** treated as a failed track. When one is hit, the app pauses **all**
+downloads, waits a 60-second cooldown (`RATE_LIMIT_COOLDOWN` in `app.py`), then
+retries — so nothing is skipped just because YouTube throttled you. You'll see
+`Pausing all downloads...` followed by `resuming downloads` in the log. If you're
+getting throttled constantly, lowering `MAX_WORKERS` reduces how hard the app hits
+YouTube in the first place.
+
+If the cookies can't be read at all (wrong browser, not logged in, locked database),
+the run **stops immediately** with a `Stopped: Could not read YouTube cookies...`
+message rather than silently failing every track — fix the cause below and re-run.
+
+Notes:
+- **Firefox** is the most reliable on Linux. Recent **Chrome / Chromium / Brave**
+  encrypt their cookie store, which can block extraction on some systems — if it
+  fails, log into YouTube in Firefox and use that instead.
+- Keep the browser **closed** while downloading if you hit "could not read cookies"
+  errors — an open browser can hold a lock on the cookie database.
+- If you log out of YouTube in that browser, the cookies go stale and you're back to
+  anonymous throttling.
