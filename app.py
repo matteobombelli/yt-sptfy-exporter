@@ -20,7 +20,6 @@ import time
 import tkinter as tk
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -32,12 +31,6 @@ DEFAULT_STRICTNESS = 0.7  # match-score floor; user-adjustable 0..1 via the UI s
 DURATION_TOLERANCE = 15  # seconds
 MIN_SOURCE_KBPS = 100   # drop tracks whose best available YouTube audio is below this (degraded uploads)
 SEARCH_RESULTS = 10     # candidates to scan per track
-MAX_WORKERS = 1         # concurrent track downloads; raise for speed, lower if YouTube throttles
-# No browser cookies: feeding logged-in YouTube cookies to yt-dlp's default web
-# client makes YouTube serve PO-token/SABR formats whose media fetch 403s.
-# Anonymous requests get the normal formats and download fine. Set to a tuple
-# like ("firefox",) only if you need logged-in access (private/age-restricted).
-COOKIES_FROM_BROWSER = None
 ACCENT = "#1DB954"
 
 # (dropdown label, quality code passed to download_audio)
@@ -50,12 +43,9 @@ QUALITY_CHOICES = [
 
 
 def make_ydl(**opts):
-    """A yt-dlp instance carrying our shared defaults: quiet output and, when the
-    user has enabled it, cookies pulled from the local browser (see
-    COOKIES_FROM_BROWSER). Per-call options override these defaults."""
-    return yt_dlp.YoutubeDL(
-        {"quiet": True, "noprogress": True,
-         "cookiesfrombrowser": COOKIES_FROM_BROWSER, **opts})
+    """A yt-dlp instance carrying our shared defaults (quiet output). Per-call
+    options override these defaults."""
+    return yt_dlp.YoutubeDL({"quiet": True, "noprogress": True, **opts})
 
 
 # ---------- spotify (public web-player API, no credentials) ----------
@@ -150,6 +140,113 @@ def spotify_track_noauth(track_id):
     }
 
 
+# ---------- apple music (keyless iTunes API + public web player) ----------
+
+# Apple Music tracks are DRM-locked, so - like Spotify - we only read metadata and
+# resolve each track to YouTube. Albums and individual songs come from Apple's
+# keyless iTunes Lookup API. Playlists (pl.* ids) are absent from that API, so they
+# go through the amp-api the web player uses, authorized with a bearer token scraped
+# at runtime from the player's JS bundle (it rotates roughly monthly).
+
+ITUNES_LOOKUP = "https://itunes.apple.com/lookup"
+
+
+def _am_get(url, headers=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", **(headers or {})})
+    with urllib.request.urlopen(req) as resp:
+        return resp.read()
+
+
+def _am_parse(url):
+    """(kind, storefront, item_id) from an Apple Music URL, where kind is
+    "playlist" | "album" | "song". A song is an album URL carrying ?i= (the song's
+    id) or a /song/ URL; storefront defaults to "us" when the path omits it."""
+    sf = re.search(r"music\.apple\.com/([a-z]{2})/", url)
+    storefront = sf.group(1) if sf else "us"
+    song = re.search(r"[?&]i=(\d+)", url)
+    if song:
+        return "song", storefront, song.group(1)
+    pl = re.search(r"/playlist/[^/]*/(pl\.[A-Za-z0-9]+)", url)
+    if pl:
+        return "playlist", storefront, pl.group(1)
+    album = re.search(r"/album/[^/]*/(\d+)", url)
+    if album:
+        return "album", storefront, album.group(1)
+    sng = re.search(r"/song/(\d+)", url)
+    if sng:
+        return "song", storefront, sng.group(1)
+    raise RuntimeError("Unrecognized Apple Music URL")
+
+
+def _am_token():
+    """Scrape the web player's anonymous bearer JWT. The JS bundle ships two JWTs;
+    the amp-api one is issued by "AMPWebPlay"."""
+    html = _am_get("https://music.apple.com/us/browse").decode("utf-8", "replace")
+    m = re.search(r'/assets/index~[^"\']+\.js', html)
+    if not m:
+        raise RuntimeError("Could not locate Apple Music web player bundle")
+    js = _am_get(f"https://music.apple.com{m.group(0)}").decode("utf-8", "replace")
+    for tok in re.findall(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", js):
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)  # restore base64 padding
+        try:
+            if json.loads(base64.urlsafe_b64decode(payload)).get("iss") == "AMPWebPlay":
+                return tok
+        except Exception:
+            continue
+    raise RuntimeError("Could not extract Apple Music web player token")
+
+
+def _am_artwork(url):
+    """Concrete 1200px cover URL from an Apple artwork reference - either an
+    amp-api {w}x{h} template or an iTunes 100x100 thumbnail."""
+    return (url or "").replace("{w}", "1200").replace("{h}", "1200").replace("100x100bb", "1200x1200bb")
+
+
+def _am_playlist_tracks(storefront, playlist_id):
+    headers = {"Authorization": f"Bearer {_am_token()}", "Origin": "https://music.apple.com"}
+    tracks = []
+    path = f"/v1/catalog/{storefront}/playlists/{playlist_id}/tracks?limit=100&offset=0"
+    while path:
+        data = json.loads(_am_get(f"https://amp-api.music.apple.com{path}", headers))
+        for item in data.get("data", []):
+            a = item.get("attributes") or {}
+            if not a.get("name"):
+                continue
+            tracks.append({
+                "artist": a.get("artistName", ""),
+                "title": a["name"],
+                "album": a.get("albumName", ""),
+                "art_url": _am_artwork((a.get("artwork") or {}).get("url", "")),
+                "duration": (a.get("durationInMillis") or 0) / 1000,
+            })
+        path = data.get("next")
+    return tracks
+
+
+def _itunes_tracks(item_id, entity=None):
+    params = {"id": item_id}
+    if entity:
+        params.update(entity=entity, limit=200)
+    data = json.loads(_am_get(f"{ITUNES_LOOKUP}?{urllib.parse.urlencode(params)}"))
+    return [{
+        "artist": r.get("artistName", ""),
+        "title": r.get("trackName", ""),
+        "album": r.get("collectionName", ""),
+        "art_url": _am_artwork(r.get("artworkUrl100", "")),
+        "duration": (r.get("trackTimeMillis") or 0) / 1000,
+    } for r in data.get("results", []) if r.get("wrapperType") == "track"]
+
+
+def apple_music_tracks(url):
+    kind, storefront, item_id = _am_parse(url)
+    if kind == "playlist":
+        return _am_playlist_tracks(storefront, item_id)
+    if kind == "album":
+        return _itunes_tracks(item_id, entity="song")
+    return _itunes_tracks(item_id)  # single song
+
+
 # ---------- youtube matching ----------
 
 BRACKETS = re.compile(r"\(.*?\)|\[.*?\]")
@@ -239,19 +336,13 @@ def sanitize(name):
     return re.sub(r'[\\/:*?"<>|%]', "_", name).strip()
 
 
-def unique_base(outdir, name, reserved, lock):
-    """Path (without extension) for name.*, adding (2), (3)... on collision.
-
-    reserved/lock keep concurrent workers from colliding: a parallel download in
-    flight hasn't written its file yet, so we also treat names already handed out
-    (tracked in the reserved set) as taken, all under the lock."""
-    with lock:
-        base = Path(outdir) / name
-        n = 2
-        while str(base) in reserved or list(Path(outdir).glob(glob.escape(base.name) + ".*")):
-            base = Path(outdir) / f"{name} ({n})"
-            n += 1
-        reserved.add(str(base))
+def unique_base(outdir, name):
+    """Path (without extension) for name.*, adding (2), (3)... on collision."""
+    base = Path(outdir) / name
+    n = 2
+    while list(Path(outdir).glob(glob.escape(base.name) + ".*")):
+        base = Path(outdir) / f"{name} ({n})"
+        n += 1
     return str(base)
 
 
@@ -292,7 +383,6 @@ def download_audio(url, out_path_no_ext, quality="192", meta=None, art_url=None,
         "outtmpl": f"{out_path_no_ext}.%(ext)s",
         "quiet": True,
         "noprogress": True,
-        "cookiesfrombrowser": COOKIES_FROM_BROWSER,
         # let yt-dlp fetch its JS challenge solver (runs on deno), needed for
         # full YouTube format access
         "remote_components": ["ejs:github"],
@@ -397,13 +487,10 @@ def _tag_ffmpeg(path, meta, art_path):
             continue
 
 
-# ---------- rate-limit / cookie handling ----------
+# ---------- rate-limit handling ----------
 
-RATE_LIMIT_COOLDOWN = 60  # seconds to pause all workers after a YouTube 429 before retrying
-
-
-class JobAborted(Exception):
-    """Raised inside a worker to unwind it once the job has been aborted."""
+RATE_LIMIT_COOLDOWN = 60      # seconds to pause after a YouTube 429 before retrying
+MAX_RATE_LIMIT_RETRIES = 3    # cooldown+retry attempts before giving up on a 429
 
 
 def _is_rate_limit(e):
@@ -411,103 +498,19 @@ def _is_rate_limit(e):
     return "429" in s or "too many requests" in s
 
 
-def _is_bot_block(e):
-    # A 403 from YouTube's anti-bot wall. Unlike a 429 these can also be
-    # permanent (private/forbidden video), so the retry path is capped.
-    s = str(e).lower()
-    return "403" in s or "forbidden" in s or "sign in to confirm" in s
-
-
-def _is_cookie_error(e):
-    # Only meaningful when we're actually reading browser cookies; otherwise a
-    # stray "cookie" in an error (e.g. yt-dlp's bot-check message that suggests
-    # --cookies-from-browser) must not be mistaken for an extraction failure.
-    if not COOKIES_FROM_BROWSER:
-        return False
-    s = str(e).lower()
-    return any(k in s for k in ("cookie", "keyring", "could not decrypt", "dpapi"))
-
-
-class DownloadGate:
-    """Shared by a job's workers to coordinate YouTube rate-limiting.
-
-    On a 429 the worker that hit it clears the gate (pausing every worker),
-    sleeps a cooldown, then reopens it; concurrent 429s coalesce into a single
-    cooldown rather than stacking. A cookie error aborts the whole job instead -
-    retrying can't fix a misconfigured browser, and silently skipping every
-    track is what we're trying to avoid."""
-
-    def __init__(self, q, cooldown=RATE_LIMIT_COOLDOWN):
-        self.q = q
-        self.cooldown = cooldown
-        self._gate = threading.Event()
-        self._gate.set()
-        self._lock = threading.Lock()
-        self._cooling = False
-        self.aborted = threading.Event()
-        self.abort_reason = None
-
-    def wait_ready(self):
-        """Block while a cooldown is in progress. Returns False if aborted."""
-        self._gate.wait()
-        return not self.aborted.is_set()
-
-    def abort(self, reason):
-        with self._lock:
-            if not self.aborted.is_set():
-                self.abort_reason = reason
-                self.aborted.set()
-        self._gate.set()  # wake any workers parked in wait_ready / cooldown
-
-    def cooldown_and_retry(self):
-        with self._lock:
-            wait_only = self._cooling
-            if not wait_only:
-                self._cooling = True
-                self._gate.clear()
-        if wait_only:
-            self._gate.wait()  # another worker is already cooling down; ride it out
-            return
-        self.q.put(("log", f"YouTube throttling/blocking (HTTP 429/403). Pausing all "
-                           f"downloads for {self.cooldown}s, then retrying..."))
-        for _ in range(self.cooldown):
-            if self.aborted.is_set():
-                break
-            time.sleep(1)
-        with self._lock:
-            self._cooling = False
-        self._gate.set()
-        if not self.aborted.is_set():
-            self.q.put(("log", "Cooldown over - resuming downloads."))
-
-
-MAX_BLOCK_RETRIES = 3  # cooldown+retry attempts before giving up on a 429/403
-
-
-def run_with_retry(gate, fn):
-    """Run fn(), retrying after a cooldown on YouTube 429/403s and aborting the
-    job on cookie errors. A 403 can be permanent (private/forbidden video), so
-    retries are capped at MAX_BLOCK_RETRIES, after which the error propagates and
-    the track is skipped. Any other exception propagates to the caller
-    unchanged."""
-    retries = 0
-    while True:
-        if not gate.wait_ready():
-            raise JobAborted()
+def run_with_retry(q, fn):
+    """Run fn(), retrying after a cooldown on YouTube 429 rate-limits (capped at
+    MAX_RATE_LIMIT_RETRIES). Any other exception - including a 403 - propagates
+    to the caller, which logs it and moves on."""
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
         try:
             return fn()
-        except JobAborted:
-            raise
         except Exception as e:
-            if _is_cookie_error(e):
-                gate.abort(f"Could not read YouTube cookies from the browser ({e}). "
-                           f"Check COOKIES_FROM_BROWSER and that you're logged into YouTube.")
-                raise JobAborted()
-            if _is_rate_limit(e) or _is_bot_block(e):
-                retries += 1
-                if retries > MAX_BLOCK_RETRIES:
-                    raise
-                gate.cooldown_and_retry()
+            if _is_rate_limit(e) and attempt < MAX_RATE_LIMIT_RETRIES:
+                q.put(("log", f"YouTube rate-limiting (HTTP 429). Pausing {RATE_LIMIT_COOLDOWN}s, "
+                              f"then retrying..."))
+                time.sleep(RATE_LIMIT_COOLDOWN)
+                q.put(("log", "Cooldown over - resuming."))
                 continue
             raise
 
@@ -521,62 +524,54 @@ def run_spotify_job(url, outdir, q, preference="none", quality="192", strictness
     q.put(("log", f"Fetching Spotify {'track' if is_track else 'playlist'} metadata..."))
     tracks = ([spotify_track_noauth(item_id)] if is_track
               else spotify_tracks_noauth(item_id, lambda msg: q.put(("log", msg))))
+    _resolve_and_download(tracks, outdir, q, preference, quality, strictness)
+
+
+def run_apple_music_job(url, outdir, q, preference="none", quality="192", strictness=DEFAULT_STRICTNESS):
+    q.put(("log", "Fetching Apple Music metadata..."))
+    tracks = apple_music_tracks(url)
+    _resolve_and_download(tracks, outdir, q, preference, quality, strictness)
+
+
+def _resolve_and_download(tracks, outdir, q, preference, quality, strictness):
+    """Resolve each metadata track to a YouTube source and download it. Shared by
+    the Spotify and Apple Music jobs - both produce the same track dicts."""
     total = len(tracks)
-    q.put(("log", f"Found {total} tracks. Searching YouTube ({MAX_WORKERS} at a time)..."))
+    q.put(("log", f"Found {total} tracks. Searching YouTube..."))
     q.put(("progress", 0, total))
 
-    skipped, reserved, lock, done = [], set(), threading.Lock(), 0
-    gate = DownloadGate(q)
+    skipped = []
+    search_ydl = make_ydl(extract_flat=True)
+    probe_ydl = make_ydl()
 
-    def handle(i, track):
-        nonlocal done
-        if gate.aborted.is_set():
-            return
+    for i, track in enumerate(tracks, 1):
         label = f"{track['artist']} - {track['title']}"
 
         def skip(msg):
-            with lock:
-                skipped.append(label)
+            skipped.append(label)
             q.put(("log", f"[{i}/{total}] Skipped: {label} ({msg})"))
 
-        # yt-dlp instances aren't thread-safe, so each worker gets its own.
-        search_ydl = make_ydl(extract_flat=True)
-        probe_ydl = make_ydl()
         try:
             match_url, score, reason = run_with_retry(
-                gate, lambda: find_match(track, search_ydl, preference, strictness))
+                q, lambda: find_match(track, search_ydl, preference, strictness))
             if not match_url:
                 skip(reason)
-                return
-            kbps = run_with_retry(gate, lambda: best_audio_kbps(match_url, probe_ydl))
-            if 0 < kbps < MIN_SOURCE_KBPS:
-                skip(f"source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor")
-                return
-            q.put(("log", f"[{i}/{total}] Downloading (match {score:.2f}): {label}"))
-            base = unique_base(outdir, sanitize(track["title"]), reserved, lock)
-            run_with_retry(gate, lambda: download_audio(
-                match_url, base, quality=quality, meta={
-                    "title": track["title"],
-                    "artist": track["artist"],
-                    "album": track.get("album", ""),
-                }, art_url=track.get("art_url", "")))
-        except JobAborted:
-            return
+            else:
+                kbps = run_with_retry(q, lambda: best_audio_kbps(match_url, probe_ydl))
+                if 0 < kbps < MIN_SOURCE_KBPS:
+                    skip(f"source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor")
+                else:
+                    q.put(("log", f"[{i}/{total}] Downloading (match {score:.2f}): {label}"))
+                    base = unique_base(outdir, sanitize(track["title"]))
+                    run_with_retry(q, lambda: download_audio(
+                        match_url, base, quality=quality, meta={
+                            "title": track["title"],
+                            "artist": track["artist"],
+                            "album": track.get("album", ""),
+                        }, art_url=track.get("art_url", "")))
         except Exception as e:
             skip(str(e))
-        finally:
-            with lock:
-                done += 1
-                current = done
-            q.put(("progress", current, total))
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for i, track in enumerate(tracks, 1):
-            ex.submit(handle, i, track)
-
-    if gate.aborted.is_set():
-        q.put(("done", f"Stopped: {gate.abort_reason}"))
-        return
+        q.put(("progress", i, total))
 
     summary = f"Done: {total - len(skipped)} downloaded, {len(skipped)} skipped."
     if skipped:
@@ -585,62 +580,35 @@ def run_spotify_job(url, outdir, q, preference="none", quality="192", strictness
 
 
 def run_youtube_job(url, outdir, q, quality="192"):
-    gate = DownloadGate(q)
     q.put(("log", "Fetching YouTube playlist..."))
-
-    def fetch():
-        with make_ydl(extract_flat=True) as ydl:
-            return ydl.extract_info(url, download=False)
-    try:
-        info = run_with_retry(gate, fetch)
-    except JobAborted:
-        q.put(("done", f"Stopped: {gate.abort_reason}"))
-        return
+    with make_ydl(extract_flat=True) as ydl:
+        info = run_with_retry(q, lambda: ydl.extract_info(url, download=False))
     entries = [e for e in (info.get("entries") if "entries" in info else [info]) if e]
     total = len(entries)
-    q.put(("log", f"Found {total} videos. Downloading ({MAX_WORKERS} at a time)..."))
+    q.put(("log", f"Found {total} videos. Downloading..."))
     q.put(("progress", 0, total))
 
-    failed, reserved, lock, done = [], set(), threading.Lock(), 0
+    failed = []
+    probe_ydl = make_ydl()
 
-    def handle(i, entry):
-        nonlocal done
-        if gate.aborted.is_set():
-            return
+    for i, entry in enumerate(entries, 1):
         title = entry.get("title") or entry.get("id", "unknown")
-        probe_ydl = make_ydl()
         try:
             video_url = entry.get("url") or entry.get("webpage_url")
-            kbps = run_with_retry(gate, lambda: best_audio_kbps(video_url, probe_ydl))
+            kbps = run_with_retry(q, lambda: best_audio_kbps(video_url, probe_ydl))
             if 0 < kbps < MIN_SOURCE_KBPS:
-                with lock:
-                    failed.append(title)
-                q.put(("log", f"[{i}/{total}] Skipped (source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor): {title}"))
-                return
-            q.put(("log", f"[{i}/{total}] Downloading: {title}"))
-            # metadata + thumbnail are pulled from the video inside download_audio
-            base = unique_base(outdir, sanitize(title), reserved, lock)
-            run_with_retry(gate, lambda: download_audio(
-                video_url, base, quality=quality, crop_square=True))
-        except JobAborted:
-            return
-        except Exception as e:
-            with lock:
                 failed.append(title)
+                q.put(("log", f"[{i}/{total}] Skipped (source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor): {title}"))
+            else:
+                q.put(("log", f"[{i}/{total}] Downloading: {title}"))
+                # metadata + thumbnail are pulled from the video inside download_audio
+                base = unique_base(outdir, sanitize(title))
+                run_with_retry(q, lambda: download_audio(
+                    video_url, base, quality=quality, crop_square=True))
+        except Exception as e:
+            failed.append(title)
             q.put(("log", f"[{i}/{total}] Failed: {title} ({e})"))
-        finally:
-            with lock:
-                done += 1
-                current = done
-            q.put(("progress", current, total))
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for i, entry in enumerate(entries, 1):
-            ex.submit(handle, i, entry)
-
-    if gate.aborted.is_set():
-        q.put(("done", f"Stopped: {gate.abort_reason}"))
-        return
+        q.put(("progress", i, total))
 
     summary = f"Done: {total - len(failed)} downloaded, {len(failed)} failed."
     if failed:
@@ -670,7 +638,7 @@ class App:
         main.columnconfigure(1, weight=1)
         main.rowconfigure(6, weight=1)
 
-        ttk.Label(main, text="Spotify or YouTube URL (playlist or song):").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(main, text="Spotify, Apple Music, or YouTube URL (playlist or song):").grid(row=0, column=0, columnspan=3, sticky="w")
         self.url_var = tk.StringVar()
         ttk.Entry(main, textvariable=self.url_var).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 10))
 
@@ -681,7 +649,7 @@ class App:
 
         options = ttk.Frame(main)
         options.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Label(options, text="Spotify version:").pack(side="left")
+        ttk.Label(options, text="Version:").pack(side="left")
         self.pref_var = tk.StringVar(value="none")
         for label, value in (("No preference", "none"), ("Studio", "studio"), ("Live", "live")):
             ttk.Radiobutton(options, text=label, value=value, variable=self.pref_var).pack(side="left", padx=(6, 0))
@@ -734,10 +702,12 @@ class App:
         outdir = self.folder_var.get().strip()
         if "open.spotify.com" in url and re.search(r"(playlist|track)/([A-Za-z0-9]+)", url):
             kind = "spotify"
+        elif "music.apple.com" in url and re.search(r"/(playlist|album|song)/", url):
+            kind = "apple"
         elif "youtube.com" in url or "youtu.be" in url:
             kind = "youtube"
         else:
-            messagebox.showerror("Invalid URL", "Enter a Spotify playlist/track URL or a YouTube URL.")
+            messagebox.showerror("Invalid URL", "Enter a Spotify, Apple Music, or YouTube URL.")
             return
         if not outdir or not Path(outdir).is_dir():
             messagebox.showerror("No output folder", "Choose an existing output folder.")
@@ -749,6 +719,9 @@ class App:
         self.progress["value"] = 0
         if kind == "spotify":
             target = run_spotify_job
+            args = (url, outdir, self.q, self.pref_var.get(), quality, self.strictness_var.get())
+        elif kind == "apple":
+            target = run_apple_music_job
             args = (url, outdir, self.q, self.pref_var.get(), quality, self.strictness_var.get())
         else:
             target = run_youtube_job
