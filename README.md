@@ -1,26 +1,26 @@
 # yt-sptfy-exporter
 
-A simple desktop app that downloads songs from a **Spotify** or **YouTube** playlist — or a single song link — as audio files.
+A simple desktop app that downloads songs from a Spotify or YouTube playlist, or a single song link, as audio files.
 
-- **YouTube URL** (playlist or video) → downloaded directly.
-- **Spotify URL** (playlist or track) → track metadata is fetched from Spotify, then each track is matched against **YouTube** search results (title similarity + duration). The highest-scoring of the YouTube search results is downloaded only if it clears the strictness threshold; otherwise the track is skipped and listed at the end.
+- YouTube links (a playlist or a single video) are downloaded directly.
+- Spotify links (a playlist or a track) are handled by reading the track metadata from Spotify, then matching each track against YouTube search results by title similarity and duration. The highest scoring result is downloaded only if it clears the strictness threshold; any track that falls short is skipped and listed at the end.
 
-Files are tagged with Title, Artist, and Album metadata plus an embedded cover image — from Spotify for Spotify links, and from YouTube (thumbnail center-cropped to a square) for YouTube links.
+Every file is tagged with its title, artist, and album, and has a cover image embedded. Spotify links use Spotify's artwork, while YouTube links use the video thumbnail cropped to a square from the center.
 
 ## Options
 
-- **Spotify version** — *No preference* / *Studio* / *Live*. Biases the YouTube match toward studio or live recordings (applies to Spotify links only).
-- **Match strictness** — slider from `0` to `1.00` (default `0.70`). The minimum title-similarity score a YouTube result must reach to count as a confident match for a Spotify track. Higher is pickier; lower accepts looser matches. Tracks whose best match falls below the threshold are skipped entirely. Applies to Spotify links only.
-- **Quality**:
-  - *128 / 192 kbps MP3* — transcoded to MP3. Universal, but a lossy re-encode of an already-lossy source (some quality is lost).
-  - *Best (Opus, lossless)* — keeps YouTube's native Opus stream, repackaged to `.opus`. **No quality loss** and the best fidelity (Opus beats AAC at the same bitrate). Tags and cover art are embedded.
-  - *Best (.m4a, lossless)* — copies YouTube's native AAC stream to `.m4a`. No re-encode, plays everywhere, embeds cover art. Slightly lower bitrate source than Opus, and not every video offers it — if it's missing, the log will tell you to use *Best (Opus)* instead.
+- Version (No preference, Studio, or Live): biases the YouTube match toward studio or live recordings. It changes how tracks are matched, so it has no effect on direct YouTube links.
+- Match strictness: a slider from 0 to 1.00, with a default of 0.70. This is the lowest title-similarity score a YouTube result may have and still count as a confident match. Higher values are pickier; lower values accept looser matches. Any track whose best match scores below the threshold is skipped. Like the version setting, it applies only to matched tracks, not to direct YouTube links.
+- Quality:
+  - 128 or 192 kbps MP3: transcoded to MP3. It plays everywhere, but it is a lossy re-encode of an already lossy source, so some quality is lost.
+  - Best (Opus, lossless): keeps YouTube's native Opus stream and repackages it as .opus. Nothing is re-encoded, so no quality is lost, and Opus gives the best fidelity (it beats AAC at the same bitrate). Tags and cover art are embedded.
+  - Best (.m4a, lossless): copies YouTube's native AAC stream to .m4a with no re-encode. It plays everywhere and embeds cover art. Its source bitrate is slightly lower than Opus, and not every video provides it; when it is missing, the log tells you to use Best (Opus) instead.
 
-> Why the MP3 options lose quality: YouTube audio is already compressed (~128–160 kbps Opus), so re-encoding it to MP3 compresses it a second time. The **Best** options avoid this entirely by keeping the original stream. Don't bother going above 192 kbps MP3 — it only adds file size, not fidelity.
+A note on the MP3 options: YouTube audio is already compressed (roughly 128 to 160 kbps Opus), so re-encoding it to MP3 compresses it a second time. The Best options avoid this by keeping the original stream untouched. There is no benefit to going above 192 kbps MP3, since it only adds file size, not fidelity.
 
 ## Installation
 
-An install script sets up everything the app needs: [uv](https://docs.astral.sh/uv/) (Python environment management), **ffmpeg** (MP3 conversion and tagging), and **deno** (JS runtime used by yt-dlp for YouTube extraction).
+The install script sets up everything the app needs: uv for Python environment management, ffmpeg for MP3 conversion and tagging, and deno, the JavaScript runtime that yt-dlp uses for YouTube extraction.
 
 ### macOS / Linux
 
@@ -28,7 +28,7 @@ An install script sets up everything the app needs: [uv](https://docs.astral.sh/
 ./install.sh
 ```
 
-(macOS uses Homebrew for ffmpeg; Linux uses dnf/apt/pacman.)
+macOS uses Homebrew for ffmpeg; Linux uses dnf, apt, or pacman.
 
 ### Windows
 
@@ -36,9 +36,25 @@ An install script sets up everything the app needs: [uv](https://docs.astral.sh/
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-(Uses winget for everything.)
+This uses winget for everything.
 
-Restart your terminal after installing so the new tools are on your PATH.
+After installing, restart your terminal so the new tools are on your PATH.
+
+#### Desktop shortcut (optional)
+
+You can launch the app from a desktop icon instead of a terminal:
+
+1. Run `uv run app.py` once (see Running below) so the virtual environment, the `.venv` folder, is created.
+2. Right-click the desktop and choose New, then Shortcut.
+3. For the location, give the full path to the project's windowed Python followed by the full path to `app.py`. Quote both, for example:
+
+   ```
+   "C:\path\to\yt-sptfy-exporter\.venv\Scripts\pythonw.exe" "C:\path\to\yt-sptfy-exporter\app.py"
+   ```
+
+4. Name the shortcut and click Finish.
+
+Pointing the shortcut at `pythonw.exe`, the windowed build of Python, means the app opens with no console window behind it. To set a custom icon or pin the app, right-click the shortcut and use Properties, Pin to Start, or Pin to taskbar.
 
 ## Running
 
@@ -48,19 +64,12 @@ From the project folder:
 uv run app.py
 ```
 
-On first run, uv automatically creates a virtual environment (`.venv/`) and installs the dependencies.
+On the first run, uv creates a virtual environment (`.venv`) and installs the dependencies automatically.
 
-Paste a playlist or song URL, choose an output folder, and click **Download**.
+Paste a playlist or song URL, choose an output folder, and click Download.
 
-No Spotify account or API credentials are needed — track metadata is read from the
-same public web-player API the Spotify embed widget uses, so only **public**
-playlists and tracks work.
+No Spotify account or API credentials are required. Track metadata comes from the same public web-player API that the Spotify embed widget uses, so only public playlists and tracks work.
 
 ## YouTube rate-limiting
 
-The app downloads **one track at a time** to stay under YouTube's anonymous
-rate limits. If you still hit `HTTP Error 429`, a 429 is **not** treated as a
-failed track: the app pauses for a cooldown (`RATE_LIMIT_COOLDOWN` in `app.py`,
-60s by default), then retries, so nothing is skipped just because YouTube
-throttled you. You'll see a `Pausing 60s...` message followed by `resuming` in
-the log.
+The app downloads one track at a time to stay under YouTube's limits for anonymous users. If you still see `HTTP Error 429`, that response is not counted as a failed track. The app pauses for a cooldown (`RATE_LIMIT_COOLDOWN` in `app.py`, 60 seconds by default) and then retries, so nothing is dropped just because YouTube throttled you. The log shows a `Pausing 60s...` message followed by `resuming`.
