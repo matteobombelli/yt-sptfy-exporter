@@ -3,13 +3,14 @@
 A simple desktop app that downloads songs from a **Spotify** or **YouTube** playlist — or a single song link — as audio files.
 
 - **YouTube URL** (playlist or video) → downloaded directly.
-- **Spotify URL** (playlist or track) → track metadata is fetched from Spotify, then each track is matched against search results (title similarity + duration) — **SoundCloud first, then YouTube** as a fallback — and confident matches are downloaded. Tracks without a confident match on either source are skipped and listed at the end.
+- **Spotify URL** (playlist or track) → track metadata is fetched from Spotify, then each track is matched against **YouTube** search results (title similarity + duration). The highest-scoring of the YouTube search results is downloaded only if it clears the strictness threshold; otherwise the track is skipped and listed at the end.
 
 Files are tagged with Title, Artist, and Album metadata plus an embedded cover image — from Spotify for Spotify links, and from YouTube (thumbnail center-cropped to a square) for YouTube links.
 
 ## Options
 
 - **Spotify version** — *No preference* / *Studio* / *Live*. Biases the YouTube match toward studio or live recordings (applies to Spotify links only).
+- **Match strictness** — slider from `0` to `1.00` (default `0.70`). The minimum title-similarity score a YouTube result must reach to count as a confident match for a Spotify track. Higher is pickier; lower accepts looser matches. Tracks whose best match falls below the threshold are skipped entirely. Applies to Spotify links only.
 - **Quality**:
   - *128 / 192 kbps MP3* — transcoded to MP3. Universal, but a lossy re-encode of an already-lossy source (some quality is lost).
   - *Best (Opus, lossless)* — keeps YouTube's native Opus stream, repackaged to `.opus`. **No quality loss** and the best fidelity (Opus beats AAC at the same bitrate). Tags and cover art are embedded.

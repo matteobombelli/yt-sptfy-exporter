@@ -19,6 +19,7 @@ import threading
 import tkinter as tk
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -26,13 +27,11 @@ import yt_dlp
 from mutagen.flac import Picture
 from mutagen.oggopus import OggOpus
 
-MATCH_THRESHOLD = 0.6
+DEFAULT_STRICTNESS = 0.7  # match-score floor; user-adjustable 0..1 via the UI slider
 DURATION_TOLERANCE = 15  # seconds
 MIN_SOURCE_KBPS = 100   # drop tracks whose best available YouTube audio is below this (degraded uploads)
 SEARCH_RESULTS = 10     # candidates to scan per track
-# Spotify tracks are resolved against each source in order, first confident
-# match that downloads wins; YouTube is the fallback when SoundCloud comes up short.
-SEARCH_SOURCES = [("SoundCloud", "scsearch"), ("YouTube", "ytsearch")]
+MAX_WORKERS = 10        # concurrent track downloads; raise for speed, lower if YouTube throttles
 ACCENT = "#1DB954"
 
 # (dropdown label, quality code passed to download_audio)
@@ -139,7 +138,7 @@ def spotify_track_noauth(track_id):
 # ---------- youtube matching ----------
 
 BRACKETS = re.compile(r"\(.*?\)|\[.*?\]")
-NOISE_WORDS = re.compile(r"\b(official|video|audio|lyrics?|music|hd|4k|remaster(ed)?)\b")
+NOISE_WORDS = re.compile(r"\b(official|video|audio|lyrics?|music|hd|4k|remaster(ed)?|topic|vevo)\b")
 
 
 def normalize(s):
@@ -170,35 +169,44 @@ def version_allowed(title, preference):
     return True
 
 
+def _ratio(a, b):
+    """Order-invariant similarity: compare the sorted word sets so that
+    "artist title" and "title ... artist" score the same."""
+    a = " ".join(sorted(a.split()))
+    b = " ".join(sorted(b.split()))
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
 def match_score(track, entry):
     want = normalize(f"{track['artist']} {track['title']}")
-    got = normalize(entry.get("title") or "")
-    score = difflib.SequenceMatcher(None, want, got).ratio()
+    title = normalize(entry.get("title") or "")
+    # Official "Artist - Topic"/VEVO uploads often carry only the song name in the
+    # title and the artist in the channel, so also try title+channel and take the
+    # better fit; a junk channel just makes that variant score lower, never higher.
+    channel = normalize(entry.get("uploader") or entry.get("channel") or "")
+    score = max(_ratio(want, title), _ratio(want, f"{title} {channel}".strip()))
     duration = entry.get("duration")
     if track["duration"] and duration and abs(duration - track["duration"]) > DURATION_TOLERANCE:
         score -= 0.2
     return score
 
 
-def find_match(track, search_ydl, preference="none", search_prefix="ytsearch"):
-    """Return (url, score, reason). On success reason is None; otherwise it's a
-    short explanation of why no track was selected. search_prefix selects the
-    yt-dlp backend: "ytsearch" (YouTube) or "scsearch" (SoundCloud)."""
+def find_match(track, search_ydl, preference="none", threshold=DEFAULT_STRICTNESS):
+    """Return (url, score, reason). Score every candidate and take the highest; on a
+    confident match (score >= threshold) reason is None, otherwise url is None and
+    reason explains the skip. Below the threshold the track is skipped, never
+    downloaded."""
     query = f"{track['artist']} {track['title']}"
     if preference == "live":
         query += " live"
-    info = search_ydl.extract_info(f"{search_prefix}{SEARCH_RESULTS}:{query}", download=False)
+    info = search_ydl.extract_info(f"ytsearch{SEARCH_RESULTS}:{query}", download=False)
     entries = [e for e in (info.get("entries") or []) if version_allowed(e.get("title"), preference)]
     if not entries:
         return None, 0.0, f"no {preference} version in top {SEARCH_RESULTS} results"
-    best, best_score = None, 0.0
-    for entry in entries:
-        score = match_score(track, entry)
-        if score > best_score:
-            best, best_score = entry, score
-    if best and best_score >= MATCH_THRESHOLD:
+    best, best_score = max(((e, match_score(track, e)) for e in entries), key=lambda p: p[1])
+    if best_score >= threshold:
         return best["url"], best_score, None
-    return None, best_score, f"no confident match, best {best_score:.2f}"
+    return None, best_score, f"below strictness {threshold:.2f}, best {best_score:.2f}"
 
 
 def best_audio_kbps(url, probe_ydl):
@@ -216,13 +224,19 @@ def sanitize(name):
     return re.sub(r'[\\/:*?"<>|%]', "_", name).strip()
 
 
-def unique_base(outdir, name):
-    """Path (without extension) for name.*, adding (2), (3)... on collision."""
-    base = Path(outdir) / name
-    n = 2
-    while list(Path(outdir).glob(glob.escape(base.name) + ".*")):
-        base = Path(outdir) / f"{name} ({n})"
-        n += 1
+def unique_base(outdir, name, reserved, lock):
+    """Path (without extension) for name.*, adding (2), (3)... on collision.
+
+    reserved/lock keep concurrent workers from colliding: a parallel download in
+    flight hasn't written its file yet, so we also treat names already handed out
+    (tracked in the reserved set) as taken, all under the lock."""
+    with lock:
+        base = Path(outdir) / name
+        n = 2
+        while str(base) in reserved or list(Path(outdir).glob(glob.escape(base.name) + ".*")):
+            base = Path(outdir) / f"{name} ({n})"
+            n += 1
+        reserved.add(str(base))
     return str(base)
 
 
@@ -369,49 +383,60 @@ def _tag_ffmpeg(path, meta, art_path):
 
 # ---------- worker jobs (run in a thread, report via queue) ----------
 
-def run_spotify_job(url, outdir, q, preference="none", quality="192"):
+def run_spotify_job(url, outdir, q, preference="none", quality="192", strictness=DEFAULT_STRICTNESS):
     track_match = re.search(r"track/([A-Za-z0-9]+)", url)
     item_id = (track_match or re.search(r"playlist/([A-Za-z0-9]+)", url)).group(1)
     is_track = bool(track_match)
     q.put(("log", f"Fetching Spotify {'track' if is_track else 'playlist'} metadata..."))
     tracks = ([spotify_track_noauth(item_id)] if is_track
               else spotify_tracks_noauth(item_id, lambda msg: q.put(("log", msg))))
-    q.put(("log", f"Found {len(tracks)} tracks. Searching YouTube..."))
-    q.put(("progress", 0, len(tracks)))
+    total = len(tracks)
+    q.put(("log", f"Found {total} tracks. Searching YouTube ({MAX_WORKERS} at a time)..."))
+    q.put(("progress", 0, total))
 
-    search_ydl = yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "noprogress": True})
-    probe_ydl = yt_dlp.YoutubeDL({"quiet": True, "noprogress": True})
-    skipped = []
-    for i, track in enumerate(tracks, 1):
+    skipped, reserved, lock, done = [], set(), threading.Lock(), 0
+
+    def handle(i, track):
+        nonlocal done
         label = f"{track['artist']} - {track['title']}"
-        reasons, downloaded = [], False
-        for source_name, prefix in SEARCH_SOURCES:
-            try:
-                url, score, reason = find_match(track, search_ydl, preference, prefix)
-                if not url:
-                    reasons.append(f"{source_name}: {reason}")
-                    continue
-                kbps = best_audio_kbps(url, probe_ydl)
-                if 0 < kbps < MIN_SOURCE_KBPS:
-                    reasons.append(f"{source_name}: source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor")
-                    continue
-                q.put(("log", f"[{i}/{len(tracks)}] Downloading from {source_name} (match {score:.2f}): {label}"))
-                download_audio(url, unique_base(outdir, sanitize(track["title"])),
-                               quality=quality, meta={
-                                   "title": track["title"],
-                                   "artist": track["artist"],
-                                   "album": track.get("album", ""),
-                               }, art_url=track.get("art_url", ""))
-                downloaded = True
-                break
-            except Exception as e:
-                reasons.append(f"{source_name}: {e}")
-        if not downloaded:
-            skipped.append(label)
-            q.put(("log", f"[{i}/{len(tracks)}] Skipped: {label} ({'; '.join(reasons)})"))
-        q.put(("progress", i, len(tracks)))
 
-    summary = f"Done: {len(tracks) - len(skipped)} downloaded, {len(skipped)} skipped."
+        def skip(msg):
+            with lock:
+                skipped.append(label)
+            q.put(("log", f"[{i}/{total}] Skipped: {label} ({msg})"))
+
+        # yt-dlp instances aren't thread-safe, so each worker gets its own.
+        search_ydl = yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "noprogress": True})
+        probe_ydl = yt_dlp.YoutubeDL({"quiet": True, "noprogress": True})
+        try:
+            match_url, score, reason = find_match(track, search_ydl, preference, strictness)
+            if not match_url:
+                skip(reason)
+                return
+            kbps = best_audio_kbps(match_url, probe_ydl)
+            if 0 < kbps < MIN_SOURCE_KBPS:
+                skip(f"source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor")
+                return
+            q.put(("log", f"[{i}/{total}] Downloading (match {score:.2f}): {label}"))
+            download_audio(match_url, unique_base(outdir, sanitize(track["title"]), reserved, lock),
+                           quality=quality, meta={
+                               "title": track["title"],
+                               "artist": track["artist"],
+                               "album": track.get("album", ""),
+                           }, art_url=track.get("art_url", ""))
+        except Exception as e:
+            skip(str(e))
+        finally:
+            with lock:
+                done += 1
+                current = done
+            q.put(("progress", current, total))
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for i, track in enumerate(tracks, 1):
+            ex.submit(handle, i, track)
+
+    summary = f"Done: {total - len(skipped)} downloaded, {len(skipped)} skipped."
     if skipped:
         summary += "\nSkipped tracks:\n  " + "\n  ".join(skipped)
     q.put(("done", summary))
@@ -422,31 +447,43 @@ def run_youtube_job(url, outdir, q, quality="192"):
     with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "noprogress": True}) as ydl:
         info = ydl.extract_info(url, download=False)
     entries = [e for e in (info.get("entries") if "entries" in info else [info]) if e]
-    q.put(("log", f"Found {len(entries)} videos."))
-    q.put(("progress", 0, len(entries)))
+    total = len(entries)
+    q.put(("log", f"Found {total} videos. Downloading ({MAX_WORKERS} at a time)..."))
+    q.put(("progress", 0, total))
 
-    probe_ydl = yt_dlp.YoutubeDL({"quiet": True, "noprogress": True})
-    failed = []
-    for i, entry in enumerate(entries, 1):
+    failed, reserved, lock, done = [], set(), threading.Lock(), 0
+
+    def handle(i, entry):
+        nonlocal done
         title = entry.get("title") or entry.get("id", "unknown")
+        probe_ydl = yt_dlp.YoutubeDL({"quiet": True, "noprogress": True})
         try:
             video_url = entry.get("url") or entry.get("webpage_url")
             kbps = best_audio_kbps(video_url, probe_ydl)
             if 0 < kbps < MIN_SOURCE_KBPS:
-                failed.append(title)
-                q.put(("log", f"[{i}/{len(entries)}] Skipped (source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor): {title}"))
-                q.put(("progress", i, len(entries)))
-                continue
-            q.put(("log", f"[{i}/{len(entries)}] Downloading: {title}"))
+                with lock:
+                    failed.append(title)
+                q.put(("log", f"[{i}/{total}] Skipped (source {kbps:.0f} kbps < {MIN_SOURCE_KBPS} kbps floor): {title}"))
+                return
+            q.put(("log", f"[{i}/{total}] Downloading: {title}"))
             # metadata + thumbnail are pulled from the video inside download_audio
-            download_audio(video_url, unique_base(outdir, sanitize(title)),
+            download_audio(video_url, unique_base(outdir, sanitize(title), reserved, lock),
                            quality=quality, crop_square=True)
         except Exception as e:
-            failed.append(title)
-            q.put(("log", f"[{i}/{len(entries)}] Failed: {title} ({e})"))
-        q.put(("progress", i, len(entries)))
+            with lock:
+                failed.append(title)
+            q.put(("log", f"[{i}/{total}] Failed: {title} ({e})"))
+        finally:
+            with lock:
+                done += 1
+                current = done
+            q.put(("progress", current, total))
 
-    summary = f"Done: {len(entries) - len(failed)} downloaded, {len(failed)} failed."
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for i, entry in enumerate(entries, 1):
+            ex.submit(handle, i, entry)
+
+    summary = f"Done: {total - len(failed)} downloaded, {len(failed)} failed."
     if failed:
         summary += "\nFailed videos:\n  " + "\n  ".join(failed)
     q.put(("done", summary))
@@ -472,7 +509,7 @@ class App:
         main = ttk.Frame(root, padding=16)
         main.pack(fill="both", expand=True)
         main.columnconfigure(1, weight=1)
-        main.rowconfigure(5, weight=1)
+        main.rowconfigure(6, weight=1)
 
         ttk.Label(main, text="Spotify or YouTube URL (playlist or song):").grid(row=0, column=0, columnspan=3, sticky="w")
         self.url_var = tk.StringVar()
@@ -494,18 +531,28 @@ class App:
         ttk.Combobox(options, textvariable=self.quality_var, state="readonly", width=22,
                      values=[label for label, _ in QUALITY_CHOICES]).pack(side="left", padx=(6, 0))
 
+        strictness = ttk.Frame(main)
+        strictness.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(strictness, text="Match strictness:").pack(side="left")
+        self.strictness_var = tk.DoubleVar(value=DEFAULT_STRICTNESS)
+        self.strictness_label = ttk.Label(strictness, text=f"{DEFAULT_STRICTNESS:.2f}", width=4)
+        ttk.Scale(strictness, from_=0.0, to=1.0, variable=self.strictness_var, length=180,
+                  command=lambda v: self.strictness_label.config(text=f"{float(v):.2f}")).pack(side="left", padx=(6, 0))
+        self.strictness_label.pack(side="left")
+        ttk.Label(strictness, text="(Spotify→YouTube match; higher = pickier)").pack(side="left", padx=(8, 0))
+
         self.download_btn = ttk.Button(main, text="Download", style="Accent.TButton", command=self._start)
-        self.download_btn.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 8))
+        self.download_btn.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(12, 8))
 
         self.log = tk.Text(main, height=12, state="disabled", wrap="word",
                            relief="flat", background="#f5f5f5")
-        self.log.grid(row=5, column=0, columnspan=3, sticky="nsew")
+        self.log.grid(row=6, column=0, columnspan=3, sticky="nsew")
         scroll = ttk.Scrollbar(main, command=self.log.yview)
-        scroll.grid(row=5, column=3, sticky="ns")
+        scroll.grid(row=6, column=3, sticky="ns")
         self.log["yscrollcommand"] = scroll.set
 
         self.progress = ttk.Progressbar(main, mode="determinate")
-        self.progress.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.progress.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
         if not shutil.which("ffmpeg"):
             self._log("WARNING: ffmpeg not found on PATH - audio conversion will fail. See README.")
@@ -543,7 +590,7 @@ class App:
         self.progress["value"] = 0
         if kind == "spotify":
             target = run_spotify_job
-            args = (url, outdir, self.q, self.pref_var.get(), quality)
+            args = (url, outdir, self.q, self.pref_var.get(), quality, self.strictness_var.get())
         else:
             target = run_youtube_job
             args = (url, outdir, self.q, quality)
