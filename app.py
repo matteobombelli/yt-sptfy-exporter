@@ -581,7 +581,9 @@ def _resolve_and_download(tracks, outdir, q, preference, quality, strictness):
 
 def run_youtube_job(url, outdir, q, quality="192"):
     q.put(("log", "Fetching YouTube playlist..."))
-    with make_ydl(extract_flat=True) as ydl:
+    # 'in_playlist' (not True) so a watch?v=...&list=... URL still recurses into
+    # the playlist; plain extract_flat=True stops at a flat reference -> 1 entry.
+    with make_ydl(extract_flat="in_playlist") as ydl:
         info = run_with_retry(q, lambda: ydl.extract_info(url, download=False))
     entries = [e for e in (info.get("entries") if "entries" in info else [info]) if e]
     total = len(entries)
