@@ -14,7 +14,25 @@ if command -v ffmpeg >/dev/null 2>&1; then
 else
     echo "Installing ffmpeg..."
     if [ "$(uname)" = "Darwin" ]; then
-        brew install ffmpeg
+        if command -v brew >/dev/null 2>&1; then
+            brew install ffmpeg
+        else
+            # Fresh Mac with no Homebrew: download a static ffmpeg build (no admin needed).
+            echo "Homebrew not found; downloading a static ffmpeg build instead..."
+            case "$(uname -m)" in
+                arm64) ff_url="https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip" ;;
+                *)     ff_url="https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release/ffmpeg.zip" ;;
+            esac
+            ff_tmp="$(mktemp -d)"
+            curl -fsSL "$ff_url" -o "$ff_tmp/ffmpeg.zip"
+            unzip -o -q "$ff_tmp/ffmpeg.zip" -d "$ff_tmp"
+            mkdir -p "$HOME/.local/bin"
+            mv "$(find "$ff_tmp" -name ffmpeg -type f | head -n1)" "$HOME/.local/bin/ffmpeg"
+            chmod +x "$HOME/.local/bin/ffmpeg"
+            xattr -d com.apple.quarantine "$HOME/.local/bin/ffmpeg" 2>/dev/null || true
+            rm -rf "$ff_tmp"
+            echo "Installed static ffmpeg to ~/.local/bin"
+        fi
     elif command -v dnf >/dev/null 2>&1; then
         sudo dnf install -y ffmpeg
     elif command -v apt-get >/dev/null 2>&1; then

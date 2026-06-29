@@ -20,9 +20,23 @@ A note on the MP3 options: YouTube audio is already compressed (roughly 128 to 1
 
 ## Installation
 
+### Easiest: download and double-click (no terminal)
+
+If you don't use GitHub or a terminal, this is the way:
+
+1. Go to the [**Releases**](https://github.com/matteobombelli/yt-sptfy-exporter/releases/latest) page and download **yt-sptfy-exporter.zip** (under *Assets*). No GitHub account needed. Unzip it.
+2. Open the unzipped folder and start the app:
+   - **macOS:** right-click **Start.command** and choose **Open**, then **Open** again. Right-click only the first time — macOS blocks downloaded scripts until you approve one once; after that a plain double-click works.
+   - **Windows:** double-click **Start.bat**. If a blue "Windows protected your PC" box appears, click **More info**, then **Run anyway**.
+3. The first run installs everything the app needs (uv, ffmpeg, deno) — on a fresh Mac this needs no Homebrew and no admin password. On Windows it may ask for permission; after setup finishes, double-click **Start.bat** once more to open the app.
+
+Paste a playlist or song link, pick a folder, and click Download. Every later launch is a single double-click. (Linux: use the terminal steps below.)
+
+### Set up from a terminal
+
 The install script sets up everything the app needs: uv for Python environment management, ffmpeg for MP3 conversion and tagging, and deno, the JavaScript runtime that yt-dlp uses for YouTube extraction.
 
-### macOS / Linux
+#### macOS / Linux
 
 ```sh
 ./install.sh
@@ -30,7 +44,7 @@ The install script sets up everything the app needs: uv for Python environment m
 
 macOS uses Homebrew for ffmpeg; Linux uses dnf, apt, or pacman.
 
-### Windows
+#### Windows
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1
@@ -40,7 +54,7 @@ This uses winget for everything.
 
 After installing, restart your terminal so the new tools are on your PATH.
 
-#### Desktop shortcut (optional)
+##### Desktop shortcut (optional)
 
 You can launch the app from a desktop icon instead of a terminal:
 
