@@ -7,3 +7,5 @@ dependencies = ["yt-dlp", "mutagen"]
 
 [tool.uv]
 package = false
+# Always pull the newest yt-dlp: old versions get 403s when YouTube changes.
+upgrade-package = ["yt-dlp"]
